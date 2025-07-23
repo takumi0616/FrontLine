@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ログファイル
+*.log
+
+# 一時ファイル
+trash/
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# その他
+.DS_Store
+
+# ログ
+*.log
+
+# データ
+main/128_128
+main/v31_result
