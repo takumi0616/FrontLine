@@ -1178,7 +1178,7 @@ def run_stage1():
     model_init_end = time.time()
     print(f"[Stage1] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
 
-    num_epochs_stage1 = 3
+    num_epochs_stage1 = 50
     ckpt_start = time.time()
     start_epoch = 0
     os.makedirs(model_s1_save_dir, exist_ok=True)
@@ -1749,7 +1749,7 @@ def run_stage2():
     optimizer_s2=optim.AdamW(model_s2.parameters(),lr=1e-4,weight_decay=0.05)
     model_init_end = time.time()
     print(f"[Stage2] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
-    num_epochs_stage2 = 3
+    num_epochs_stage2 = 50
     ckpt_start = time.time()
     start_epoch=0
     os.makedirs(model_s2_save_dir,exist_ok=True)
