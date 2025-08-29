@@ -31,10 +31,7 @@ import torchvision.transforms as transforms
 import time
 import torch.backends.cudnn
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-import torch.utils.checkpoint as checkpoint
 import matplotlib
-from einops import rearrange
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import math
 import pandas as pd
 from skan import Skeleton 
@@ -58,6 +55,147 @@ from typing import Optional
 import shap                            
 import torch
 import torch.nn as nn
+
+# Swin-UNet core implementation is moved out to keep this file lean
+# Ensure this file's directory is on sys.path so local module import works when run from repo root
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.resolve()))
+from swin_unet import SwinTransformerSys
+
+# ======================================
+# Global configuration (centralized params)
+# ======================================
+CFG = {
+    "SEED": 0,
+    "THREADS": 4,
+    "PATHS": {
+        "nc_gsm_dir": "./128_128/nc_gsm9",
+        "nc_0p5_dir": "./128_128/nc_0p5_bulge_v2",
+        "stage1_out_dir": "./v31_result/stage1_nc",
+        "stage2_out_dir": "./v31_result/stage2_nc",
+        "stage3_out_dir": "./v31_result/stage3_nc",
+        "model_s1_save_dir": "./v31_result/stage1_model",
+        "model_s2_save_dir": "./v31_result/stage2_model",
+        "output_visual_dir": "./v31_result/visualizations",
+        "stage4_svg_dir": "./v31_result/stage4_svg",
+    },
+    "IMAGE": {
+        "ORIG_H": 128,
+        "ORIG_W": 128,
+    },
+    "STAGE1": {
+        "num_classes": 6,
+        "in_chans": 93,
+        "epochs": 50,
+        "train_months": (2014, 1, 2022, 12),
+        "test_months":  (2023, 1, 2023, 12),
+        "dataloader": {
+            "batch_size_train": 16,
+            "batch_size_test": 1,
+            "num_workers": 4
+        },
+        "optimizer": {
+            "lr": 1e-4,
+            "weight_decay": 0.05
+        },
+        "model": {
+            "img_size": 128,
+            "patch_size": 2,
+            "embed_dim": 192,
+            "depths": [2, 2, 2, 2],
+            "depths_decoder": [1, 2, 2, 2],
+            "num_heads": [3, 6, 12, 24],
+            "window_size": 16,
+            "mlp_ratio": 4.0,
+            "qkv_bias": True,
+            "qk_scale": None,
+            "drop_rate": 0.0,
+            "attn_drop_rate": 0.0,
+            "drop_path_rate": 0.1,
+            "norm_layer": nn.LayerNorm,
+            "ape": True,
+            "patch_norm": True,
+            "use_checkpoint": False,
+            "final_upsample": "expand_first"
+        }
+    },
+    "STAGE2": {
+        "num_classes": 6,
+        "in_chans": 1,
+        "epochs": 50,
+        "train_months": (2014, 1, 2022, 12),
+        "dataloader": {
+            "batch_size_train": 16,
+            "batch_size_val": 1,
+            "batch_size_test": 1,
+            "num_workers": 4
+        },
+        "optimizer": {
+            "lr": 1e-4,
+            "weight_decay": 0.05
+        },
+        "model": {
+            "img_size": 128,
+            "patch_size": 2,
+            "embed_dim": 96,
+            "depths": [2, 2, 2, 2],
+            "depths_decoder": [1, 2, 2, 2],
+            "num_heads": [3, 6, 12, 24],
+            "window_size": 16,
+            "mlp_ratio": 4.0,
+            "qkv_bias": True,
+            "qk_scale": None,
+            "drop_rate": 0.0,
+            "attn_drop_rate": 0.0,
+            "drop_path_rate": 0.1,
+            "norm_layer": nn.LayerNorm,
+            "ape": False,
+            "patch_norm": True,
+            "use_checkpoint": False,
+            "final_upsample": "expand_first"
+        },
+        "augment": {
+            "n_augment": 10,
+            "prob_dilation": 0.8,
+            "prob_create_gaps": 0.8,
+            "prob_random_pixel_change": 0.8,
+            "prob_add_fake_front": 0.8,
+            "dilation_kernel_range": (2, 3),
+            "num_gaps_range": (2, 4),
+            "gap_size_range": (3, 5),
+            "num_pix_to_change_range": (20, 100),
+            "num_fake_front_range": (2, 10)
+        }
+    },
+    "VISUALIZATION": {
+        "class_colors": {
+            0: "#FFFFFF",
+            1: "#FF0000",
+            2: "#0000FF",
+            3: "#008015",
+            4: "#800080",
+            5: "#FFA500"
+        },
+        "pressure_vmin": -40,
+        "pressure_vmax": 40,
+        "pressure_levels": 21,
+        "parallel_factor": 4
+    },
+    "VIDEO": {
+        "image_folder": "./v31_result/visualizations/",
+        "output_folder": "./v31_result/",
+        "frame_rate": 4,
+        "low_res_scale": 4,
+        "low_res_frame_rate": 2
+    },
+    "SHAP": {
+        "use_gpu": True,
+        "max_samples_per_class": 500,
+        "out_root": "./v31_result/shap_stage1",
+        "free_mem_threshold_gb": 4.0
+    }
+}
 
 if torch.cuda.is_available():
     print("GPU is available!")
@@ -153,636 +291,12 @@ def create_comparison_videos(image_folder="./v31_result/visualizations/",
     else:
         print("[動画作成] 年間動画用の画像ファイルが見つかりませんでした。")
 
-class MoEFFNGating(nn.Module):
-    def __init__(self, dim, hidden_dim, num_experts):
-        super(MoEFFNGating, self).__init__()
-        self.gating_network = nn.Linear(dim, dim)
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)) for _ in range(num_experts)])
-
-    def forward(self, x):
-        weights = self.gating_network(x)
-        weights = torch.nn.functional.softmax(weights, dim=-1)
-        outputs = [expert(x) for expert in self.experts]
-        outputs = torch.stack(outputs, dim=0)
-        outputs = (weights.unsqueeze(0) * outputs).sum(dim=0)
-        return outputs
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-def window_partition(x, window_size):
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
-
-
-def window_reverse(windows, window_size, H, W):
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return x
-
-
-class WindowAttention(nn.Module):
-
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
-
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size  
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  
-
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  
-        coords_flatten = torch.flatten(coords, 1)  
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous() 
-        relative_coords[:, :, 0] += self.window_size[0] - 1 
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)  
-        self.register_buffer("relative_position_index", relative_position_index)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        trunc_normal_(self.relative_position_bias_table, std=.02)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x, mask=None):
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2] 
-
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
-    def flops(self, N):
-        flops = 0
-        flops += N * self.dim * 3 * self.dim
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        flops += N * self.dim * self.dim
-        return flops
-
-
-class SwinTransformerBlock(nn.Module):
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
-        self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-        if self.shift_size > 0:
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1)) 
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-
-            mask_windows = window_partition(img_mask, self.window_size) 
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
-
-        self.register_buffer("attn_mask", attn_mask)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
-
-        x_windows = window_partition(shifted_x, self.window_size) 
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  
-        attn_windows = self.attn(x_windows, mask=self.attn_mask) 
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = shifted_x
-
-        x = x.view(B, H * W, C)       
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        flops += self.dim * H * W
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        flops += self.dim * H * W
-        return flops
-
-
-class PatchMerging(nn.Module):
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
-
-        x = x.view(B, H, W, C)
-
-        x0 = x[:, 0::2, 0::2, :] 
-        x1 = x[:, 1::2, 0::2, :] 
-        x2 = x[:, 0::2, 1::2, :] 
-        x3 = x[:, 1::2, 1::2, :]  
-        x = torch.cat([x0, x1, x2, x3], -1) 
-        x = x.view(B, -1, 4 * C) 
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.dim
-        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
-        return flops
-
-
-class PatchExpand(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.expand = nn.Linear(dim, 2 * dim, bias=False) if dim_scale == 2 else nn.Identity()
-        self.norm = norm_layer(dim // dim_scale)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        x = self.expand(x)
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-
-        x = x.view(B, H, W, C)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=2, c=C // 4)
-        x = x.view(B, -1, C // 4)
-        x = self.norm(x)
-
-        return x
-
-
-class FinalPatchExpand_X4(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.dim_scale = dim_scale
-        self.expand = nn.Linear(dim, 16 * dim, bias=False)
-        self.output_dim = dim
-        self.norm = norm_layer(self.output_dim)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        x = self.expand(x)
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-
-        x = x.view(B, H, W, C)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale,
-                      c=C // (self.dim_scale ** 2))
-        x = x.view(B, -1, self.output_dim)
-        x = self.norm(x)
-
-        return x
-
-class FinalPatchExpand(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.dim_scale = dim_scale
-        self.expand = nn.Linear(dim, dim_scale * dim_scale * dim, bias=False)
-        self.output_dim = dim
-        self.norm = norm_layer(self.output_dim)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        x = self.expand(x)
-        B, L, C = x.shape
-
-        x = x.view(B, H, W, C)
-        x = rearrange(
-            x,
-            'b h w (p1 p2 c)-> b (h p1) (w p2) c',
-            p1=self.dim_scale,
-            p2=self.dim_scale,
-            c=C // (self.dim_scale ** 2)
-        )
-        x = x.view(B, -1, self.output_dim)
-        x = self.norm(x)
-
-        return x
-
-
-class BasicLayer(nn.Module):
-    def __init__(self, dim, input_resolution, depth, num_heads, window_size,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
-
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.depth = depth
-        self.use_checkpoint = use_checkpoint
-        self.blocks = nn.ModuleList([
-            SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
-                                 num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
-                                 mlp_ratio=mlp_ratio,
-                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                 drop=drop, attn_drop=attn_drop,
-                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
-            for i in range(depth)])
-
-        if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
-        else:
-            self.downsample = None
-
-    def forward(self, x):
-        for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
-            else:
-                x = blk(x)
-        if self.downsample is not None:
-            x = self.downsample(x)
-        return x
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
-    def flops(self):
-        flops = 0
-        for blk in self.blocks:
-            flops += blk.flops()
-        if self.downsample is not None:
-            flops += self.downsample.flops()
-        return flops
-
-
-class BasicLayer_up(nn.Module):
-    def __init__(self, dim, input_resolution, depth, num_heads, window_size,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
-
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.depth = depth
-        self.use_checkpoint = use_checkpoint
-        self.blocks = nn.ModuleList([
-            SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
-                                 num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
-                                 mlp_ratio=mlp_ratio,
-                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                 drop=drop, attn_drop=attn_drop,
-                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
-            for i in range(depth)])
-
-        if upsample is not None:
-            self.upsample = PatchExpand(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
-        else:
-            self.upsample = None
-
-    def forward(self, x):
-        for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
-            else:
-                x = blk(x)
-        if self.upsample is not None:
-            x = self.upsample(x)
-        return x
-
-
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        if self.norm is not None:
-            x = self.norm(x)
-        return x
-
-    def flops(self):
-        Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
-
-
-class SwinTransformerSys(nn.Module):
-
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
-                 embed_dim=96, depths=[2, 2, 2, 2], depths_decoder=[1, 2, 2, 2], num_heads=[3, 6, 12, 24],
-                 window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, final_upsample="expand_first", **kwargs):
-        super().__init__()
-
-        print(
-            "SwinTransformerSys expand initial----depths:{};depths_decoder:{};drop_path_rate:{};num_classes:{}".format(
-                depths,
-                depths_decoder, drop_path_rate, num_classes))
-
-        self.num_classes = num_classes
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
-        self.ape = ape
-        self.patch_norm = patch_norm
-        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
-        self.num_features_up = int(embed_dim * 2)
-        self.mlp_ratio = mlp_ratio
-        self.final_upsample = final_upsample
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None)
-        num_patches = self.patch_embed.num_patches
-        patches_resolution = self.patch_embed.patches_resolution
-        self.patches_resolution = patches_resolution
-        if self.ape:
-            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-            trunc_normal_(self.absolute_pos_embed, std=.02)
-
-        self.pos_drop = nn.Dropout(p=drop_rate)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
-
-        self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                                 patches_resolution[1] // (2 ** i_layer)),
-                               depth=depths[i_layer],
-                               num_heads=num_heads[i_layer],
-                               window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
-                               qkv_bias=qkv_bias, qk_scale=qk_scale,
-                               drop=drop_rate, attn_drop=attn_drop_rate,
-                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer,
-                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               use_checkpoint=use_checkpoint)
-            self.layers.append(layer)
-
-        self.layers_up = nn.ModuleList()
-        self.concat_back_dim = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
-                                      int(embed_dim * 2 ** (
-                                                  self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
-            if i_layer == 0:
-                layer_up = PatchExpand(
-                    input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
-                                      patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
-                    dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
-            else:
-                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
-                                         input_resolution=(
-                                         patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
-                                         patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
-                                         depth=depths[(self.num_layers - 1 - i_layer)],
-                                         num_heads=num_heads[(self.num_layers - 1 - i_layer)],
-                                         window_size=window_size,
-                                         mlp_ratio=self.mlp_ratio,
-                                         qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                         drop=drop_rate, attn_drop=attn_drop_rate,
-                                         drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
-                                             depths[:(self.num_layers - 1 - i_layer) + 1])],
-                                         norm_layer=norm_layer,
-                                         upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
-                                         use_checkpoint=use_checkpoint)
-            self.layers_up.append(layer_up)
-            self.concat_back_dim.append(concat_linear)
-
-        self.norm = norm_layer(self.num_features)
-        self.norm_up = norm_layer(self.embed_dim)
-
-        if self.final_upsample == "expand_first":
-            print("---final upsample expand_first---")
-            self.up = FinalPatchExpand(
-                input_resolution=(img_size // patch_size, img_size // patch_size),
-                dim_scale=patch_size,
-                dim=embed_dim
-            )
-            self.output = nn.Conv2d(
-                in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False
-            )
-
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
-
-    def forward_features(self, x):
-        x = self.patch_embed(x)
-        if self.ape:
-            x = x + self.absolute_pos_embed
-        x = self.pos_drop(x)
-        x_downsample = []
-
-        for layer in self.layers:
-            x_downsample.append(x)
-            x = layer(x)
-
-        x = self.norm(x)
-        return x, x_downsample
-
-    def forward_up_features(self, x, x_downsample):
-        for inx, layer_up in enumerate(self.layers_up):
-            if inx == 0:
-                x = layer_up(x)
-            else:
-                x = torch.cat([x, x_downsample[3 - inx]], -1)
-                x = self.concat_back_dim[inx](x)
-                x = layer_up(x)
-
-        x = self.norm_up(x)
-
-        return x
-
-    def up_x(self, x):
-        H, W = self.patches_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input features has wrong size"
-
-        if self.final_upsample == "expand_first":
-            x = self.up(x)
-            x = x.view(B, self.up.dim_scale * H, self.up.dim_scale * W, -1)
-            x = x.permute(0, 3, 1, 2)
-            x = self.output(x)
-        return x
-
-    def forward(self, x):
-        x, x_downsample = self.forward_features(x)
-        x = self.forward_up_features(x, x_downsample)
-        x = self.up_x(x)
-        return x
-
-    def flops(self):
-        flops = 0
-        flops += self.patch_embed.flops()
-        for i, layer in enumerate(self.layers):
-            flops += layer.flops()
-        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
-        flops += self.num_features * self.num_classes
-        return flops
-
 def print_memory_usage(msg=""):
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info().rss / 1024 / 1024 
     print(f"[Memory] {msg} memory usage: {mem_info:.2f} MB")
 
-seed = 0
+seed = CFG["SEED"]
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -794,17 +308,17 @@ print(f'Random seed set as {seed}')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
-nc_gsm_dir = './128_128/nc_gsm9'
-nc_0p5_dir = './128_128/nc_0p5_bulge_v2'
-stage1_out_dir = './v31_result/stage1_nc'
-stage2_out_dir = './v31_result/stage2_nc'
-stage3_out_dir = './v31_result/stage3_nc'
-model_s1_save_dir = './v31_result/stage1_model'
-model_s2_save_dir = './v31_result/stage2_model'
-output_visual_dir = './v31_result/visualizations'
+nc_gsm_dir = CFG["PATHS"]["nc_gsm_dir"]
+nc_0p5_dir = CFG["PATHS"]["nc_0p5_dir"]
+stage1_out_dir = CFG["PATHS"]["stage1_out_dir"]
+stage2_out_dir = CFG["PATHS"]["stage2_out_dir"]
+stage3_out_dir = CFG["PATHS"]["stage3_out_dir"]
+model_s1_save_dir = CFG["PATHS"]["model_s1_save_dir"]
+model_s2_save_dir = CFG["PATHS"]["model_s2_save_dir"]
+output_visual_dir = CFG["PATHS"]["output_visual_dir"]
 
-ORIG_H = 128
-ORIG_W = 128
+ORIG_H = CFG["IMAGE"]["ORIG_H"]
+ORIG_W = CFG["IMAGE"]["ORIG_W"]
 
 def get_available_months(start_year, start_month, end_year, end_month):
     months = []
@@ -947,29 +461,30 @@ class FrontalDatasetStage1(Dataset):
         return gsm_tensor, target_cls, time_str
 
 class SwinUnetModel(nn.Module):
-    def __init__(self, num_classes=6, in_chans=93):
+    def __init__(self, num_classes=6, in_chans=93, model_cfg=None):
         super(SwinUnetModel, self).__init__()
+        cfg = model_cfg if model_cfg is not None else CFG["STAGE1"]["model"]
         self.swin_unet = SwinTransformerSys(
-            img_size=128,
-            patch_size=2,
+            img_size=cfg["img_size"],
+            patch_size=cfg["patch_size"],
             in_chans=in_chans,
             num_classes=num_classes,
-            embed_dim=192,
-            depths=[2, 2, 2, 2],
-            depths_decoder=[1, 2, 2, 2],
-            num_heads=[3, 6, 12, 24],
-            window_size=16,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            qk_scale=None,
-            drop_rate=0.,
-            attn_drop_rate=0.,
-            drop_path_rate=0.1,
-            norm_layer=nn.LayerNorm,
-            ape=True,
-            patch_norm=True,
-            use_checkpoint=False,
-            final_upsample="expand_first"
+            embed_dim=cfg["embed_dim"],
+            depths=cfg["depths"],
+            depths_decoder=cfg["depths_decoder"],
+            num_heads=cfg["num_heads"],
+            window_size=cfg["window_size"],
+            mlp_ratio=cfg["mlp_ratio"],
+            qkv_bias=cfg["qkv_bias"],
+            qk_scale=cfg["qk_scale"],
+            drop_rate=cfg["drop_rate"],
+            attn_drop_rate=cfg["attn_drop_rate"],
+            drop_path_rate=cfg["drop_path_rate"],
+            norm_layer=cfg["norm_layer"],
+            ape=cfg["ape"],
+            patch_norm=cfg["patch_norm"],
+            use_checkpoint=cfg["use_checkpoint"],
+            final_upsample=cfg["final_upsample"]
         )
 
     def forward(self, x):
@@ -994,7 +509,7 @@ class DiceLoss(nn.Module):
             total_loss += dice_loss
         return total_loss / self.classes
 
-num_classes_stage1 = 6
+num_classes_stage1 = CFG["STAGE1"]["num_classes"]
 ce_loss = nn.CrossEntropyLoss()
 dice_loss = DiceLoss(classes=num_classes_stage1)
 
@@ -1114,11 +629,11 @@ def evaluate_stage1(model, dataloader, save_nc_dir=None):
     targ_flat = all_targets.view(-1).numpy()
 
     precision, recall, f1, _ = precision_recall_fscore_support(
-        targ_flat, pred_flat, labels=range(6), average=None, zero_division=0
+        targ_flat, pred_flat, labels=range(num_classes_stage1), average=None, zero_division=0
     )
     accuracy = (pred_flat == targ_flat).sum() / len(targ_flat)*100
-    print(f"\n[Stage1] Pixel Accuracy (all classes 0-5): {accuracy:.2f}%")
-    for i in range(6):
+    print(f"\n[Stage1] Pixel Accuracy (all classes): {accuracy:.2f}%")
+    for i in range(num_classes_stage1):
         print(f"  Class{i}: Precision={precision[i]:.4f}, Recall={recall[i]:.4f}, F1={f1[i]:.4f}")
     metrics_end = time.time()
     print(f"[Stage1] 評価指標計算時間: {format_time(metrics_end - metrics_start)}")
@@ -1133,7 +648,7 @@ def evaluate_stage1(model, dataloader, save_nc_dir=None):
             lat = dataloader.dataset.lat
             lon = dataloader.dataset.lon
             da = xr.DataArray(probs_np, dims=["lat","lon","class"],
-                              coords={"lat": lat, "lon": lon, "class": np.arange(6)})
+                              coords={"lat": lat, "lon": lon, "class": np.arange(num_classes_stage1)})
             ds = xr.Dataset({"probabilities": da})
             ds = ds.expand_dims("time")
             ds["time"] = [pd.to_datetime(time_str)]
@@ -1160,25 +675,27 @@ def run_stage1():
     print_memory_usage("Start Stage 1")
     stage1_start = time.time()
     ds_start = time.time()
-    train_months = get_available_months(2014,1,2022,12)
-    test_months  = get_available_months(2023,1,2023,12)
+    y1, m1, y2, m2 = CFG["STAGE1"]["train_months"]
+    train_months = get_available_months(y1, m1, y2, m2)
+    y1, m1, y2, m2 = CFG["STAGE1"]["test_months"]
+    test_months  = get_available_months(y1, m1, y2, m2)
 
     train_dataset_s1 = FrontalDatasetStage1(train_months, nc_gsm_dir, nc_0p5_dir)
     test_dataset_s1  = FrontalDatasetStage1(test_months,  nc_gsm_dir, nc_0p5_dir)
-    train_loader_s1  = DataLoader(train_dataset_s1, batch_size=16, shuffle=True, num_workers=4)
-    test_loader_s1   = DataLoader(test_dataset_s1,  batch_size=1,  shuffle=False, num_workers=4)
+    train_loader_s1  = DataLoader(train_dataset_s1, batch_size=CFG["STAGE1"]["dataloader"]["batch_size_train"], shuffle=True, num_workers=CFG["STAGE1"]["dataloader"]["num_workers"])
+    test_loader_s1   = DataLoader(test_dataset_s1,  batch_size=CFG["STAGE1"]["dataloader"]["batch_size_test"],  shuffle=False, num_workers=CFG["STAGE1"]["dataloader"]["num_workers"])
     ds_end = time.time()
     print(f"[Stage1] データセット準備時間: {format_time(ds_end - ds_start)}")
 
     print(f"[Stage1] Train dataset size: {len(train_dataset_s1)}")
     print(f"[Stage1] Test  dataset size: {len(test_dataset_s1)}")
     model_init_start = time.time()
-    model_s1 = SwinUnetModel(num_classes=6, in_chans=93).to(device)
-    optimizer_s1 = optim.AdamW(model_s1.parameters(), lr=1e-4, weight_decay=0.05)
+    model_s1 = SwinUnetModel(num_classes=CFG["STAGE1"]["num_classes"], in_chans=CFG["STAGE1"]["in_chans"], model_cfg=CFG["STAGE1"]["model"]).to(device)
+    optimizer_s1 = optim.AdamW(model_s1.parameters(), lr=CFG["STAGE1"]["optimizer"]["lr"], weight_decay=CFG["STAGE1"]["optimizer"]["weight_decay"])
     model_init_end = time.time()
     print(f"[Stage1] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
 
-    num_epochs_stage1 = 50
+    num_epochs_stage1 = CFG["STAGE1"]["epochs"]
     ckpt_start = time.time()
     start_epoch = 0
     os.makedirs(model_s1_save_dir, exist_ok=True)
@@ -1208,8 +725,8 @@ def run_stage1():
     training_start = time.time()
     for epoch in range(start_epoch, num_epochs_stage1):
         epoch_start = time.time()
-        train_loss = train_stage1_one_epoch(model_s1, train_loader_s1, optimizer_s1, epoch, 6)
-        test_loss = test_stage1_one_epoch(model_s1, test_loader_s1, epoch, 6)
+        train_loss = train_stage1_one_epoch(model_s1, train_loader_s1, optimizer_s1, epoch, CFG["STAGE1"]["num_classes"])
+        test_loss = test_stage1_one_epoch(model_s1, test_loader_s1, epoch, CFG["STAGE1"]["num_classes"])
         train_losses.append(train_loss)
         test_losses.append(test_loss)
         if test_loss < best_test_loss:
@@ -1533,29 +1050,30 @@ class FrontalRefinementDataset(Dataset):
         return degraded
 
 class SwinUnetModelStage2(nn.Module):
-    def __init__(self, num_classes=6, in_chans=1):
+    def __init__(self, num_classes=6, in_chans=1, model_cfg=None):
         super(SwinUnetModelStage2,self).__init__()
+        cfg = model_cfg if model_cfg is not None else CFG["STAGE2"]["model"]
         self.swin_unet = SwinTransformerSys(
-            img_size=128,
-            patch_size=2,
+            img_size=cfg["img_size"],
+            patch_size=cfg["patch_size"],
             in_chans=in_chans,
             num_classes=num_classes,
-            embed_dim=96,
-            depths=[2, 2, 2, 2],
-            depths_decoder=[1, 2, 2, 2],
-            num_heads=[3, 6, 12, 24],
-            window_size=16,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            qk_scale=None,
-            drop_rate=0.,
-            attn_drop_rate=0.,
-            drop_path_rate=0.1,
-            norm_layer=nn.LayerNorm,
-            ape=False,
-            patch_norm=True,
-            use_checkpoint=False,
-            final_upsample="expand_first"
+            embed_dim=cfg["embed_dim"],
+            depths=cfg["depths"],
+            depths_decoder=cfg["depths_decoder"],
+            num_heads=cfg["num_heads"],
+            window_size=cfg["window_size"],
+            mlp_ratio=cfg["mlp_ratio"],
+            qkv_bias=cfg["qkv_bias"],
+            qk_scale=cfg["qk_scale"],
+            drop_rate=cfg["drop_rate"],
+            attn_drop_rate=cfg["attn_drop_rate"],
+            drop_path_rate=cfg["drop_path_rate"],
+            norm_layer=cfg["norm_layer"],
+            ape=cfg["ape"],
+            patch_norm=cfg["patch_norm"],
+            use_checkpoint=cfg["use_checkpoint"],
+            final_upsample=cfg["final_upsample"]
         )
     def forward(self,x):
         return self.swin_unet(x)
@@ -1668,17 +1186,17 @@ def evaluate_stage2(model, dataloader, save_nc_dir=None):
         targ_flat=all_targets.view(-1).numpy()
 
         precision, recall, f1, _ = precision_recall_fscore_support(
-            targ_flat,pred_flat,labels=[0,1,2,3,4,5],average=None,zero_division=0)
+            targ_flat, pred_flat, labels=list(range(CFG["STAGE2"]["num_classes"])), average=None, zero_division=0)
         accuracy = (pred_flat==targ_flat).sum()/len(targ_flat)*100
-        print(f"\n[Stage2] Pixel Accuracy (all classes 0-5): {accuracy:.2f}%")
-        for i, cls_id in enumerate([0,1,2,3,4,5]):
+        print(f"\n[Stage2] Pixel Accuracy (all classes): {accuracy:.2f}%")
+        for i, cls_id in enumerate(list(range(CFG["STAGE2"]["num_classes"]))):
             print(f"  Class{cls_id}: Precision={precision[i]:.4f}, Recall={recall[i]:.4f}, F1={f1[i]:.4f}")
 
-        cm=confusion_matrix(targ_flat,pred_flat,labels=[0,1,2,3,4,5])
+        cm=confusion_matrix(targ_flat,pred_flat,labels=list(range(CFG["STAGE2"]["num_classes"])))
         plt.figure(figsize=(6,5))
         sns.heatmap(cm,annot=True,fmt='d',cmap='Blues',
-                    xticklabels=[0,1,2,3,4,5],
-                    yticklabels=[0,1,2,3,4,5])
+                    xticklabels=list(range(CFG["STAGE2"]["num_classes"])),
+                    yticklabels=list(range(CFG["STAGE2"]["num_classes"])))
         plt.title('[Stage2] Confusion Matrix')
         plt.xlabel('Predicted')
         plt.ylabel('Actual')
@@ -1696,7 +1214,7 @@ def evaluate_stage2(model, dataloader, save_nc_dir=None):
             probs_np=all_probs[i].numpy()
             probs_np=np.transpose(probs_np,(1,2,0))
             da=xr.DataArray(probs_np,dims=["lat","lon","class"],
-                            coords={"lat":lat,"lon":lon,"class":np.arange(6)})
+                            coords={"lat":lat,"lon":lon,"class":np.arange(CFG["STAGE2"]["num_classes"])})
             ds=xr.Dataset({"probabilities":da})
             ds=ds.expand_dims('time')
             ds['time']=[pd.to_datetime(time_str)]
@@ -1722,34 +1240,54 @@ def run_stage2():
     print_memory_usage("Start Stage 2")
     stage2_start = time.time()
     ds_start = time.time()
-    train_months=get_available_months(2014,1,2022,12)
+    y1, m1, y2, m2 = CFG["STAGE2"]["train_months"]
+    train_months = get_available_months(y1, m1, y2, m2)
 
+    aug = CFG["STAGE2"]["augment"]
     train_dataset_s2=FrontalRefinementDataset(
         months=train_months,
         nc_0p5_dir=nc_0p5_dir,
         mode='train',
         stage1_out_dir=None,
-        n_augment=10
+        n_augment=aug["n_augment"],
+        prob_dilation=aug["prob_dilation"],
+        prob_create_gaps=aug["prob_create_gaps"],
+        prob_random_pixel_change=aug["prob_random_pixel_change"],
+        prob_add_fake_front=aug["prob_add_fake_front"],
+        dilation_kernel_range=aug["dilation_kernel_range"],
+        num_gaps_range=aug["num_gaps_range"],
+        gap_size_range=aug["gap_size_range"],
+        num_pix_to_change_range=aug["num_pix_to_change_range"],
+        num_fake_front_range=aug["num_fake_front_range"]
     )
     val_dataset_s2=FrontalRefinementDataset(
         months=train_months,
         nc_0p5_dir=nc_0p5_dir,
         mode='val',
         stage1_out_dir=None,
-        n_augment=10
+        n_augment=aug["n_augment"],
+        prob_dilation=aug["prob_dilation"],
+        prob_create_gaps=aug["prob_create_gaps"],
+        prob_random_pixel_change=aug["prob_random_pixel_change"],
+        prob_add_fake_front=aug["prob_add_fake_front"],
+        dilation_kernel_range=aug["dilation_kernel_range"],
+        num_gaps_range=aug["num_gaps_range"],
+        gap_size_range=aug["gap_size_range"],
+        num_pix_to_change_range=aug["num_pix_to_change_range"],
+        num_fake_front_range=aug["num_fake_front_range"]
     )
-    train_loader_s2=DataLoader(train_dataset_s2,batch_size=16,shuffle=True,num_workers=4)
-    val_loader_s2=DataLoader(val_dataset_s2,batch_size=1,shuffle=False,num_workers=4)
+    train_loader_s2=DataLoader(train_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"],shuffle=True,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
+    val_loader_s2=DataLoader(val_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],shuffle=False,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
     ds_end = time.time()
     print(f"[Stage2] データセット準備時間: {format_time(ds_end - ds_start)}")
     print(f"[Stage2] Train dataset size: {len(train_dataset_s2)}")
     print(f"[Stage2] Val   dataset size: {len(val_dataset_s2)}")
     model_init_start = time.time()
-    model_s2=SwinUnetModelStage2(num_classes=6,in_chans=1).to(device)
-    optimizer_s2=optim.AdamW(model_s2.parameters(),lr=1e-4,weight_decay=0.05)
+    model_s2=SwinUnetModelStage2(num_classes=CFG["STAGE2"]["num_classes"],in_chans=CFG["STAGE2"]["in_chans"], model_cfg=CFG["STAGE2"]["model"]).to(device)
+    optimizer_s2=optim.AdamW(model_s2.parameters(),lr=CFG["STAGE2"]["optimizer"]["lr"],weight_decay=CFG["STAGE2"]["optimizer"]["weight_decay"])
     model_init_end = time.time()
     print(f"[Stage2] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
-    num_epochs_stage2 = 50
+    num_epochs_stage2 = CFG["STAGE2"]["epochs"]
     ckpt_start = time.time()
     start_epoch=0
     os.makedirs(model_s2_save_dir,exist_ok=True)
@@ -1778,8 +1316,8 @@ def run_stage2():
     training_start = time.time()
     for epoch in range(start_epoch, num_epochs_stage2):
         epoch_start = time.time()
-        train_loss = train_stage2_one_epoch(model_s2, train_loader_s2, optimizer_s2, epoch, 6)
-        val_loss = test_stage2_one_epoch(model_s2, val_loader_s2, epoch, 6)
+        train_loss = train_stage2_one_epoch(model_s2, train_loader_s2, optimizer_s2, epoch, CFG["STAGE2"]["num_classes"])
+        val_loss = test_stage2_one_epoch(model_s2, val_loader_s2, epoch, CFG["STAGE2"]["num_classes"])
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         if val_loss < best_val_loss:
@@ -1852,7 +1390,7 @@ def run_stage2():
         mode='test',
         stage1_out_dir=stage1_out_dir
     )
-    test_loader_s2=DataLoader(test_dataset_s2,batch_size=1,shuffle=False,num_workers=4)
+    test_loader_s2=DataLoader(test_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_test"],shuffle=False,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
     print(f"[Stage2] Test dataset size (Stage1結果): {len(test_dataset_s2)}")
     if best_model_state is not None:
         model_s2.load_state_dict(best_model_state)
@@ -1964,25 +1502,18 @@ def visualize_results(stage1_nc_dir,stage2_nc_dir,stage3_nc_dir,original_nc_dir,
     common_times= sorted(set(stage1_dict.keys()) & set(stage2_dict.keys()) & set(stage3_dict.keys()))
     print(f"共通の時間数: {len(common_times)}")
 
-    class_colors = {
-        0: '#FFFFFF',
-        1: '#FF0000',   # warm
-        2: '#0000FF',   # cold
-        3: '#008015',   # stationary
-        4: '#800080',   # occluded
-        5: '#FFA500',   # warm_cold
-    }
-    cmap = mcolors.ListedColormap([class_colors[i] for i in range(6)])
-    bounds=np.arange(7)-0.5
+    class_colors = CFG["VISUALIZATION"]["class_colors"]
+    cmap = mcolors.ListedColormap([class_colors[i] for i in sorted(class_colors.keys())])
+    bounds=np.arange(len(class_colors)+1)-0.5
     norm=mcolors.BoundaryNorm(bounds,cmap.N)
 
-    pressure_vmin=-40
-    pressure_vmax=40
-    pressure_levels=np.linspace(pressure_vmin,pressure_vmax,21)
+    pressure_vmin=CFG["VISUALIZATION"]["pressure_vmin"]
+    pressure_vmax=CFG["VISUALIZATION"]["pressure_vmax"]
+    pressure_levels=np.linspace(pressure_vmin,pressure_vmax,CFG["VISUALIZATION"]["pressure_levels"])
     pressure_norm=mcolors.Normalize(vmin=pressure_vmin,vmax=pressure_vmax)
     cmap_pressure=plt.get_cmap('RdBu_r')
 
-    nc_gsm_alt='./128_128/nc_gsm9'
+    nc_gsm_alt=nc_gsm_dir
 
     inputs=[]
     for t_str in common_times:
@@ -2003,7 +1534,7 @@ def visualize_results(stage1_nc_dir,stage2_nc_dir,stage3_nc_dir,original_nc_dir,
         ))
     print("キャッシュ・地図データ生成のため、最初の1件のみシリアル処理します。")
     process_single_time(inputs[0])
-    num_processes=max(1, multiprocessing.cpu_count()//4)
+    num_processes=max(1, multiprocessing.cpu_count()//CFG["VISUALIZATION"]["parallel_factor"])
     print(f"{num_processes}個のプロセスで並列処理を開始します。")
     with multiprocessing.Pool(processes=num_processes) as pool:
         list(tqdm(pool.imap_unordered(process_single_time,inputs),total=len(inputs),desc='可視化処理中'))
@@ -2100,7 +1631,7 @@ def process_single_time(args):
     ds_orig.close()
     del ds_orig, orig_data
     gc.collect()
-    lowcenter_nc7_dir = './128_128/nc_gsm9'
+    lowcenter_nc7_dir = nc_gsm_alt
     nc7_file = os.path.join(lowcenter_nc7_dir, f"gsm{month_str}.nc")
     low_mask = None
     low_center_exists = False
@@ -2287,9 +1818,9 @@ def compute_metrics(y_true, y_pred, labels):
 def run_evaluation():
     print("[Evaluation] Start evaluation for 2023 data (6 classes).")
 
-    ratio_buf_s1 = {c:[] for c in range(1,6)}
-    ratio_buf_s2 = {c:[] for c in range(1,6)}
-    ratio_buf_s3 = {c:[] for c in range(1,6)}
+    ratio_buf_s1 = {c:[] for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_buf_s2 = {c:[] for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_buf_s3 = {c:[] for c in range(1, CFG["STAGE1"]["num_classes"])}
     stage1_files = sorted([f for f in os.listdir(stage1_out_dir) if f.startswith("prob_2023") and f.endswith('.nc')])
     stage2_files = sorted([f for f in os.listdir(stage2_out_dir) if f.startswith("refined_2023") and f.endswith('.nc')])
     stage3_files = sorted([f for f in os.listdir(stage3_out_dir) if f.startswith("skeleton_2023") and f.endswith('.nc')])
@@ -2369,10 +1900,10 @@ def run_evaluation():
     stage3_all = np.concatenate([arr.flatten() for arr in stage3_pred_list], axis=0)
     gt_all = np.concatenate([arr.flatten() for arr in gt_list], axis=0)
     
-    label_6 = [0, 1, 2, 3, 4, 5]
-    cm_s1 = confusion_matrix(gt_all, stage1_all, labels=label_6)
-    cm_s2 = confusion_matrix(gt_all, stage2_all, labels=label_6)
-    cm_s3 = confusion_matrix(gt_all, stage3_all, labels=label_6)
+    label_all = list(range(CFG["STAGE1"]["num_classes"]))
+    cm_s1 = confusion_matrix(gt_all, stage1_all, labels=label_all)
+    cm_s2 = confusion_matrix(gt_all, stage2_all, labels=label_all)
+    cm_s3 = confusion_matrix(gt_all, stage3_all, labels=label_all)
     
     total_cnt = len(gt_list)
     count_s1 = sum(1 for i in range(total_cnt) if set(np.unique(stage1_pred_list[i])) == set(np.unique(gt_list[i])))
@@ -2392,9 +1923,9 @@ def run_evaluation():
         kappa = cohen_kappa_score(y_true, y_pred)
         return acc, macro_prec, macro_rec, macro_f1, kappa
 
-    acc1, mp1, mr1, mf1, kappa1 = calc_stage_metrics(gt_all, stage1_all, label_6)
-    acc2, mp2, mr2, mf2, kappa2 = calc_stage_metrics(gt_all, stage2_all, label_6)
-    acc3, mp3, mr3, mf3, kappa3 = calc_stage_metrics(gt_all, stage3_all, label_6)
+    acc1, mp1, mr1, mf1, kappa1 = calc_stage_metrics(gt_all, stage1_all, label_all)
+    acc2, mp2, mr2, mf2, kappa2 = calc_stage_metrics(gt_all, stage2_all, label_all)
+    acc3, mp3, mr3, mf3, kappa3 = calc_stage_metrics(gt_all, stage3_all, label_all)
     
     df_metrics_full = pd.DataFrame({
         "Accuracy (%)": [acc1, acc2, acc3],
@@ -2409,16 +1940,16 @@ def run_evaluation():
     stage2_all_f = stage2_all[filter_mask]
     stage3_all_f = stage3_all[filter_mask]
     gt_all_f = gt_all[filter_mask]
-    labels_5 = [1, 2, 3, 4, 5]
+    labels_5 = list(range(1, CFG["STAGE1"]["num_classes"]))
     
     if len(gt_all_f) > 0:
         acc1_f, mp1_f, mr1_f, mf1_f, kappa1_f = calc_stage_metrics(gt_all_f, stage1_all_f, labels_5)
         acc2_f, mp2_f, mr2_f, mf2_f, kappa2_f = calc_stage_metrics(gt_all_f, stage2_all_f, labels_5)
-        acc3_f, mp3_f, mr3_f, mf3_f, kappa3_f = calc_stage_metrics(gt_all_f, stage3_all_f, labels_5)
+        acc3_f, mp3_f, mr3_f, kappa3_f = calc_stage_metrics(gt_all_f, stage3_all_f, labels_5)
     else:
         acc1_f = mp1_f = mr1_f = mf1_f = kappa1_f = 0
         acc2_f = mp2_f = mr2_f = mf2_f = kappa2_f = 0
-        acc3_f = mp3_f = mr3_f = mf3_f = kappa3_f = 0
+        acc3_f = mp3_f = mr3_f = kappa3_f = 0
     
     df_metrics_filtered = pd.DataFrame({
         "Accuracy (%)": [acc1_f, acc2_f, acc3_f],
@@ -2428,12 +1959,12 @@ def run_evaluation():
         "Cohen Kappa": [kappa1_f, kappa2_f, kappa3_f]
     }, index=["Stage1", "Stage2", "Stage3"])
     
-    ratio_s1_cls = {c: np.mean(ratio_buf_s1[c]) if ratio_buf_s1[c] else np.nan for c in range(1,6)}
-    ratio_s2_cls = {c: np.mean(ratio_buf_s2[c]) if ratio_buf_s2[c] else np.nan for c in range(1,6)}
-    ratio_s3_cls = {c: np.mean(ratio_buf_s3[c]) if ratio_buf_s3[c] else np.nan for c in range(1,6)}
+    ratio_s1_cls = {c: np.mean(ratio_buf_s1[c]) if ratio_buf_s1[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_s2_cls = {c: np.mean(ratio_buf_s2[c]) if ratio_buf_s2[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_s3_cls = {c: np.mean(ratio_buf_s3[c]) if ratio_buf_s3[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
 
     rmse_s1_cls, rmse_s2_cls, rmse_s3_cls = {}, {}, {}
-    for c in range(1,6):
+    for c in range(1, CFG["STAGE1"]["num_classes"]):
         gt_bin        = (gt_all       == c).astype(np.float32)
         pred_s1_bin   = (stage1_all   == c).astype(np.float32)
         pred_s2_bin   = (stage2_all   == c).astype(np.float32)
@@ -2455,7 +1986,7 @@ def run_evaluation():
     
     ax1 = fig.add_subplot(gs[0, 0])
     sns.heatmap(cm_s1_norm, annot=cm_s1, fmt='d', cmap='Blues',
-                xticklabels=label_6, yticklabels=label_6, ax=ax1,
+                xticklabels=label_all, yticklabels=label_all, ax=ax1,
                 vmin=0, vmax=1.0)
     ax1.set_title("Stage1 Confusion Matrix (All Classes)")
     ax1.set_xlabel("Predicted")
@@ -2463,7 +1994,7 @@ def run_evaluation():
     
     ax2 = fig.add_subplot(gs[0, 1])
     sns.heatmap(cm_s2_norm, annot=cm_s2, fmt='d', cmap='Blues',
-                xticklabels=label_6, yticklabels=label_6, ax=ax2,
+                xticklabels=label_all, yticklabels=label_all, ax=ax2,
                 vmin=0, vmax=1.0)
     ax2.set_title("Stage2 Confusion Matrix (All Classes)")
     ax2.set_xlabel("Predicted")
@@ -2471,7 +2002,7 @@ def run_evaluation():
     
     ax3 = fig.add_subplot(gs[0, 2])
     sns.heatmap(cm_s3_norm, annot=cm_s3, fmt='d', cmap='Blues',
-                xticklabels=label_6, yticklabels=label_6, ax=ax3,
+                xticklabels=label_all, yticklabels=label_all, ax=ax3,
                 vmin=0, vmax=1.0)
     ax3.set_title("Stage3 Confusion Matrix (All Classes)")
     ax3.set_xlabel("Predicted")
@@ -2502,14 +2033,14 @@ def run_evaluation():
     table_filtered.auto_set_font_size(False)
     table_filtered.set_fontsize(10)
     ax_table_filtered.set_title("Evaluation Metrics (Front Only: Classes 1-5)", fontweight="bold", pad=20)
-    ratio_text  = "Pixel-count ratio (pred/GT) 〈mean, cls1-5〉\n" + \
-                  f"  S1: {', '.join([f'C{c}:{ratio_s1_cls[c]:.2f}' for c in range(1,6)])}\n" + \
-                  f"  S2: {', '.join([f'C{c}:{ratio_s2_cls[c]:.2f}' for c in range(1,6)])}\n" + \
-                  f"  S3: {', '.join([f'C{c}:{ratio_s3_cls[c]:.2f}' for c in range(1,6)])}"
-    rmse_text   = "RMSE (cls1-5)\n" + \
-                  f"  S1: {', '.join([f'C{c}:{rmse_s1_cls[c]:.3f}' for c in range(1,6)])}\n" + \
-                  f"  S2: {', '.join([f'C{c}:{rmse_s2_cls[c]:.3f}' for c in range(1,6)])}\n" + \
-                  f"  S3: {', '.join([f'C{c}:{rmse_s3_cls[c]:.3f}' for c in range(1,6)])}"
+    ratio_text  = "Pixel-count ratio (pred/GT) 〈mean, cls1-〉\n" + \
+                  "  S1: " + ", ".join([f"C{c}:{ratio_s1_cls[c]:.2f}" for c in range(1, CFG['STAGE1']['num_classes'])]) + "\n" + \
+                  "  S2: " + ", ".join([f"C{c}:{ratio_s2_cls[c]:.2f}" for c in range(1, CFG['STAGE1']['num_classes'])]) + "\n" + \
+                  "  S3: " + ", ".join([f"C{c}:{ratio_s3_cls[c]:.2f}" for c in range(1, CFG['STAGE1']['num_classes'])])
+    rmse_text   = "RMSE (cls1-)\n" + \
+                  "  S1: " + ", ".join([f"C{c}:{rmse_s1_cls[c]:.3f}" for c in range(1, CFG['STAGE1']['num_classes'])]) + "\n" + \
+                  "  S2: " + ", ".join([f"C{c}:{rmse_s2_cls[c]:.3f}" for c in range(1, CFG['STAGE1']['num_classes'])]) + "\n" + \
+                  "  S3: " + ", ".join([f"C{c}:{rmse_s3_cls[c]:.3f}" for c in range(1, CFG['STAGE1']['num_classes'])])
 
     summary_text = (f"Time-wise Presence-set match  (%): "
                     f"S1 {ratio_s1:.2f}, S2 {ratio_s2:.2f}, S3 {ratio_s3:.2f}\n"
@@ -2635,21 +2166,21 @@ def evaluate_stage4(stage3_nc_dir, output_svg_dir):
         gc.collect()
 
 def run_stage4():
-    stage3_nc_dir = "./v31_result/stage3_nc"
-    output_svg_dir = "./v31_result/stage4_svg"
+    stage3_nc_dir = stage3_out_dir
+    output_svg_dir = CFG["PATHS"]["stage4_svg_dir"]
     evaluate_stage4(stage3_nc_dir, output_svg_dir)
     print("【Stage4 Improved】 SVG 出力処理が完了しました。")
 
 for k in ["OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS",
           "VECLIB_MAXIMUM_THREADS","NUMEXPR_NUM_THREADS"]:
-    os.environ[k] = "4"
-torch.set_num_threads(4)
+    os.environ[k] = str(CFG["THREADS"])
+torch.set_num_threads(CFG["THREADS"])
 def _rss_mb():  return psutil.Process(os.getpid()).memory_info().rss/1024/1024
 def _gpu_mb():  return torch.cuda.memory_allocated()/1024/1024 if torch.cuda.is_available() else 0
 def _mem(tag):  print(f"[Mem] {tag:18s}  CPU:{_rss_mb():7.1f}MB  GPU:{_gpu_mb():7.1f}MB")
 def _load_model(ckpt:str, device):
-    from main import SwinUnetModel 
-    net = SwinUnetModel(num_classes=6, in_chans=93)
+    # Avoid self-import; directly construct the wrapper model
+    net = SwinUnetModel(num_classes=CFG["STAGE1"]["num_classes"], in_chans=CFG["STAGE1"]["in_chans"], model_cfg=CFG["STAGE1"]["model"])
     obj = torch.load(ckpt, map_location="cpu")
     sd  = obj if isinstance(obj, OrderedDict) else obj["model_state_dict"]
     sd  = OrderedDict((k[7:] if k.startswith("module.") else k, v) for k,v in sd.items())
@@ -2726,7 +2257,7 @@ def _save_summary(cls_tag, stats, X, S, out_dir):
     plt.figure(); shap.plots.waterfall(expl,max_display=20,show=False)
     plt.title(f"{cls_tag}  waterfall (sample0)"); plt.tight_layout()
     plt.savefig(csv.replace(".csv","_waterfall.png"),dpi=200); plt.close()
-def _pick_gpu(th=4.0):
+def _pick_gpu(th=CFG["SHAP"]["free_mem_threshold_gb"]):
     if not torch.cuda.is_available(): return None
     best=-1; bid=None
     for i in range(torch.cuda.device_count()):
@@ -2756,13 +2287,13 @@ def run_stage1_shap_evaluation_cpu(use_gpu=True,
         def __init__(self,net,cid): super().__init__(); self.net,self.cid=net,cid
         def forward(self,x): return self.net(x)[:,self.cid].mean((1,2),keepdim=True)
     bg,_ ,_=ds[idxs[0]]; bg=bg.unsqueeze(0).to(device)
-    expl={c:shap.GradientExplainer(Wrap(model,c),data=bg) for c in range(1,6)}
+    expl={c: shap.GradientExplainer(Wrap(model,c), data=bg) for c in range(1, num_classes_stage1)}
     stats={c:OnlineMoments() for c in range(1,6)}
     Xbuf =defaultdict(list); Sbuf=defaultdict(list)
 
     for idx in tqdm(idxs,desc="Compute SHAP"):
         x, y, _ = ds[idx]
-        present=set(np.unique(y.numpy())) & {1,2,3,4,5}
+        present=set(np.unique(y.numpy())) & set(range(1, num_classes_stage1))
         for c in present:
             if len(Xbuf[c])>=max_samples_per_class: continue
             xx=x.unsqueeze(0).to(device)
@@ -2776,10 +2307,10 @@ def run_stage1_shap_evaluation_cpu(use_gpu=True,
             stats[c].update(val)                         
             Sbuf[c].append(val.mean((1,2)))              
             Xbuf[c].append(xx.cpu().numpy()[0].mean((1,2)))
-        if all(len(Xbuf[k])>=max_samples_per_class for k in range(1,6)):
+        if all(len(Xbuf[k])>=max_samples_per_class for k in range(1, num_classes_stage1)):
             break
     cname={1:"WarmFront",2:"ColdFront",3:"Stationary",4:"Occluded",5:"Complex"}
-    for c in range(1,6):
+    for c in range(1, CFG["STAGE1"]["num_classes"]):
         if Xbuf[c]:
             _save_summary(cname[c], stats[c],
                           np.vstack(Xbuf[c]), np.vstack(Sbuf[c]),
@@ -2807,7 +2338,9 @@ def main():
     stage1_end = time.time()
     print(f"Stage1 実行時間: {format_time(stage1_end - stage1_start)}")
     shap_start = time.time()
-    run_stage1_shap_evaluation_cpu(use_gpu=True)
+    run_stage1_shap_evaluation_cpu(use_gpu=CFG["SHAP"]["use_gpu"],
+                                   max_samples_per_class=CFG["SHAP"]["max_samples_per_class"],
+                                   out_root=CFG["SHAP"]["out_root"])
     shap_end = time.time()
     print(f"Stage1 SHAP分析 実行時間: {format_time(shap_end - shap_start)}")
     stage2_start = time.time()
@@ -2827,7 +2360,13 @@ def main():
     eval_end = time.time()
     print(f"評価処理 実行時間: {format_time(eval_end - eval_start)}")
     video_start = time.time()
-    create_comparison_videos()
+    create_comparison_videos(
+        image_folder=CFG["VIDEO"]["image_folder"],
+        output_folder=CFG["VIDEO"]["output_folder"],
+        frame_rate=CFG["VIDEO"]["frame_rate"],
+        low_res_scale=CFG["VIDEO"]["low_res_scale"],
+        low_res_frame_rate=CFG["VIDEO"]["low_res_frame_rate"]
+    )
     video_end = time.time()
     print(f"動画作成 実行時間: {format_time(video_end - video_start)}")
     stage4_start = time.time()

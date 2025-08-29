@@ -1,5 +1,5 @@
 ```bash
-nohup python main.py > output.log 2>&1 &
+notify-run gpu02 -- nohup python main.py > output.log 2>&1 &
 ```
 
 タスクの削除
