@@ -9,7 +9,6 @@ __pycache__/
 *.log
 
 # 一時ファイル
-trash/
 *.tmp
 *.temp
 
@@ -26,5 +25,5 @@ trash/
 *.log
 
 # データ
-main/128_128
-main/v31_result
+128_128
+v31_result

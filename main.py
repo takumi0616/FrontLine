@@ -1914,14 +1914,7 @@ def run_evaluation():
     ratio_s3 = (count_s3 / total_cnt * 100) if total_cnt > 0 else 0
     
     def calc_stage_metrics(y_true, y_pred, labels):
-        acc = np.mean(y_true == y_pred) * 100
-        macro_prec, macro_rec, macro_f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=labels, average='macro', zero_division=0)
-        macro_prec *= 100
-        macro_rec *= 100
-        macro_f1  *= 100
-        kappa = cohen_kappa_score(y_true, y_pred)
-        return acc, macro_prec, macro_rec, macro_f1, kappa
+        return compute_metrics(y_true, y_pred, labels)
 
     acc1, mp1, mr1, mf1, kappa1 = calc_stage_metrics(gt_all, stage1_all, label_all)
     acc2, mp2, mr2, mf2, kappa2 = calc_stage_metrics(gt_all, stage2_all, label_all)
@@ -1945,11 +1938,11 @@ def run_evaluation():
     if len(gt_all_f) > 0:
         acc1_f, mp1_f, mr1_f, mf1_f, kappa1_f = calc_stage_metrics(gt_all_f, stage1_all_f, labels_5)
         acc2_f, mp2_f, mr2_f, mf2_f, kappa2_f = calc_stage_metrics(gt_all_f, stage2_all_f, labels_5)
-        acc3_f, mp3_f, mr3_f, kappa3_f = calc_stage_metrics(gt_all_f, stage3_all_f, labels_5)
+        acc3_f, mp3_f, mr3_f, mf3_f, kappa3_f = calc_stage_metrics(gt_all_f, stage3_all_f, labels_5)
     else:
         acc1_f = mp1_f = mr1_f = mf1_f = kappa1_f = 0
         acc2_f = mp2_f = mr2_f = mf2_f = kappa2_f = 0
-        acc3_f = mp3_f = mr3_f = kappa3_f = 0
+        acc3_f = mp3_f = mr3_f = mf3_f = kappa3_f = 0
     
     df_metrics_filtered = pd.DataFrame({
         "Accuracy (%)": [acc1_f, acc2_f, acc3_f],
