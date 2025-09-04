@@ -789,6 +789,24 @@ def run_stage1():
         plt.savefig(loss_curve_path)
         plt.close()
         print(f"[Stage1] Loss曲線を保存しました: {loss_curve_path}")
+        # Save loss history as CSV for logging
+        try:
+            epochs_col = epochs
+        except NameError:
+            epochs_col = list(range(1, len(train_losses) + 1))
+        df_loss_s1 = pd.DataFrame({
+            "epoch": epochs_col,
+            "train_loss": train_losses,
+            "test_loss": test_losses
+        })
+        csv_path_s1 = os.path.join(model_s1_save_dir, "loss_history.csv")
+        df_loss_s1.to_csv(csv_path_s1, index=False)
+        # Also place a copy in v31_result root for easy access
+        try:
+            root_csv_s1 = os.path.join(os.path.dirname(model_s1_save_dir), "loss_history_stage1.csv")
+            df_loss_s1.to_csv(root_csv_s1, index=False)
+        except Exception as e:
+            print(f"[Stage1] Loss history CSV copy skipped: {e}")
     
     final_save_end = time.time()
     print(f"[Stage1] 最終モデル保存時間: {format_time(final_save_end - final_save_start)}")
@@ -1380,6 +1398,24 @@ def run_stage2():
         plt.savefig(loss_curve_path)
         plt.close()
         print(f"[Stage2] Loss曲線を保存しました: {loss_curve_path}")
+        # Save loss history as CSV for logging
+        try:
+            epochs_col = epochs
+        except NameError:
+            epochs_col = list(range(1, len(train_losses) + 1))
+        df_loss_s2 = pd.DataFrame({
+            "epoch": epochs_col,
+            "train_loss": train_losses,
+            "val_loss": val_losses
+        })
+        csv_path_s2 = os.path.join(model_s2_save_dir, "loss_history.csv")
+        df_loss_s2.to_csv(csv_path_s2, index=False)
+        # Also place a copy in v31_result root for easy access
+        try:
+            root_csv_s2 = os.path.join(os.path.dirname(model_s2_save_dir), "loss_history_stage2.csv")
+            df_loss_s2.to_csv(root_csv_s2, index=False)
+        except Exception as e:
+            print(f"[Stage2] Loss history CSV copy skipped: {e}")
     
     final_save_end = time.time()
     print(f"[Stage2] 最終モデル保存時間: {format_time(final_save_end - final_save_start)}")
@@ -1893,6 +1929,13 @@ def run_evaluation():
             mask = (front_data[c, :, :] == 1)
             gt_map[mask] = c+1
         gt_list.append(gt_map)
+        # Update pixel-count ratio buffers per class (pred/GT), avoiding division by zero
+        for c in range(1, CFG["STAGE1"]["num_classes"]):
+            gt_cnt = int((gt_map == c).sum())
+            if gt_cnt > 0:
+                ratio_buf_s1[c].append(float((pred_s1 == c).sum() / gt_cnt))
+                ratio_buf_s2[c].append(float((pred_s2 == c).sum() / gt_cnt))
+                ratio_buf_s3[c].append(float((pred_s3 == c).sum() / gt_cnt))
         del ds_gt, front_data
     
     stage1_all = np.concatenate([arr.flatten() for arr in stage1_pred_list], axis=0)
@@ -1952,9 +1995,9 @@ def run_evaluation():
         "Cohen Kappa": [kappa1_f, kappa2_f, kappa3_f]
     }, index=["Stage1", "Stage2", "Stage3"])
     
-    ratio_s1_cls = {c: np.mean(ratio_buf_s1[c]) if ratio_buf_s1[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
-    ratio_s2_cls = {c: np.mean(ratio_buf_s2[c]) if ratio_buf_s2[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
-    ratio_s3_cls = {c: np.mean(ratio_buf_s3[c]) if ratio_buf_s3[c] else np.nan for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_s1_cls = {c: (float(np.mean(ratio_buf_s1[c])) if len(ratio_buf_s1[c]) > 0 else 0.0) for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_s2_cls = {c: (float(np.mean(ratio_buf_s2[c])) if len(ratio_buf_s2[c]) > 0 else 0.0) for c in range(1, CFG["STAGE1"]["num_classes"])}
+    ratio_s3_cls = {c: (float(np.mean(ratio_buf_s3[c])) if len(ratio_buf_s3[c]) > 0 else 0.0) for c in range(1, CFG["STAGE1"]["num_classes"])}
 
     rmse_s1_cls, rmse_s2_cls, rmse_s3_cls = {}, {}, {}
     for c in range(1, CFG["STAGE1"]["num_classes"]):
@@ -2044,6 +2087,71 @@ def run_evaluation():
     out_fig = "v31_result/evaluation_summary.png"
     plt.savefig(out_fig, dpi=300)
     plt.close()
+    # Write detailed text-based summary log
+    try:
+        v31_root = os.path.dirname(CFG["PATHS"]["output_visual_dir"])
+        os.makedirs(v31_root, exist_ok=True)
+        log_path = os.path.join(v31_root, "evaluation_summary.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("=== Evaluation Summary ===\n")
+            f.write(f"Generated at: {datetime.now()}\n")
+            f.write(f"Common timestamps evaluated: {len(common_keys)}\n\n")
+
+            f.write("Time-wise Presence-set match (%)\n")
+            f.write(f"  Stage1: {ratio_s1:.2f}\n  Stage2: {ratio_s2:.2f}\n  Stage3: {ratio_s3:.2f}\n\n")
+
+            f.write("Pixel-count ratio (pred/GT) per class (1-5)\n")
+            for c in range(1, CFG["STAGE1"]["num_classes"]):
+                f.write(f"  Class {c}: S1={ratio_s1_cls[c]:.4f}, S2={ratio_s2_cls[c]:.4f}, S3={ratio_s3_cls[c]:.4f}\n")
+            f.write("\n")
+
+            f.write("RMSE per class (1-5)\n")
+            for c in range(1, CFG["STAGE1"]["num_classes"]):
+                f.write(f"  Class {c}: S1={rmse_s1_cls[c]:.4f}, S2={rmse_s2_cls[c]:.4f}, S3={rmse_s3_cls[c]:.4f}\n")
+            f.write("\n")
+
+            f.write("Confusion Matrix (All classes, raw counts)\n")
+            f.write("[Stage1]\n"); f.write(pd.DataFrame(cm_s1).to_string(index=True, header=True)); f.write("\n")
+            f.write("[Stage2]\n"); f.write(pd.DataFrame(cm_s2).to_string(index=True, header=True)); f.write("\n")
+            f.write("[Stage3]\n"); f.write(pd.DataFrame(cm_s3).to_string(index=True, header=True)); f.write("\n\n")
+
+            f.write("Evaluation Metrics (All Classes)\n")
+            f.write(df_metrics_full.round(4).to_string()); f.write("\n\n")
+
+            f.write("Evaluation Metrics (Front Only: Classes 1-5)\n")
+            f.write(df_metrics_filtered.round(4).to_string()); f.write("\n\n")
+
+            # Append loss history if available
+            f.write("Loss History (from training)\n")
+            try:
+                s1_csv = os.path.join(model_s1_save_dir, "loss_history.csv")
+                if os.path.exists(s1_csv):
+                    df1 = pd.read_csv(s1_csv)
+                    f.write("[Stage1]\n")
+                    f.write(df1.to_string(index=False)); f.write("\n")
+                else:
+                    f.write("[Stage1] loss_history.csv not found.\n")
+            except Exception as e:
+                f.write(f"[Stage1] Error reading loss history: {e}\n")
+            try:
+                s2_csv = os.path.join(model_s2_save_dir, "loss_history.csv")
+                if os.path.exists(s2_csv):
+                    df2 = pd.read_csv(s2_csv)
+                    f.write("[Stage2]\n")
+                    f.write(df2.to_string(index=False)); f.write("\n")
+                else:
+                    f.write("[Stage2] loss_history.csv not found.\n")
+            except Exception as e:
+                f.write(f"[Stage2] Error reading loss history: {e}\n")
+
+            f.write("\nArtifacts\n")
+            f.write(f"  Figure: {out_fig}\n")
+            f.write(f"  Stage1 loss curve: {os.path.join(model_s1_save_dir, 'loss_curve.png')}\n")
+            f.write(f"  Stage2 loss curve: {os.path.join(model_s2_save_dir, 'loss_curve.png')}\n")
+        print(f"[Evaluation] Summary log -> {log_path}")
+    except Exception as e:
+        print(f"[Evaluation] Failed to write evaluation_summary.log: {e}")
+
     print(f"[Evaluation] Done. Figure -> {out_fig}")
 
 def smooth_polyline(points, window_size=3):
