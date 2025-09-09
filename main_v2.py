@@ -63,6 +63,15 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.resolve()))
 from swin_unet import SwinTransformerSys
 
+# DiffusionCorrector dynamic import loader
+import importlib.util as _importlib_util
+def _load_diffusion_corrector():
+    diff_path = Path(__file__).parent / "diffusion-model.py"
+    spec = _importlib_util.spec_from_file_location("diffusion_model", str(diff_path))
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.DiffusionCorrector
+
 # ======================================
 # Global configuration (centralized params)
 # ======================================
@@ -72,13 +81,13 @@ CFG = {
     "PATHS": {
         "nc_gsm_dir": "./128_128/nc_gsm9",
         "nc_0p5_dir": "./128_128/nc_0p5_bulge_v2",
-        "stage1_out_dir": "./v31_result/stage1_nc",
-        "stage2_out_dir": "./v31_result/stage2_nc",
-        "stage3_out_dir": "./v31_result/stage3_nc",
-        "model_s1_save_dir": "./v31_result/stage1_model",
-        "model_s2_save_dir": "./v31_result/stage2_model",
-        "output_visual_dir": "./v31_result/visualizations",
-        "stage4_svg_dir": "./v31_result/stage4_svg",
+        "stage1_out_dir": "./v2_result/stage1_nc",
+        "stage2_out_dir": "./v2_result/stage2_nc",
+        "stage3_out_dir": "./v2_result/stage3_nc",
+        "model_s1_save_dir": "./v2_result/stage1_model",
+        "model_s2_save_dir": "./v2_result/stage2_model",
+        "output_visual_dir": "./v2_result/visualizations",
+        "stage4_svg_dir": "./v2_result/stage4_svg",
     },
     "IMAGE": {
         "ORIG_H": 128,
@@ -166,6 +175,13 @@ CFG = {
             "gap_size_range": (3, 5),
             "num_pix_to_change_range": (20, 100),
             "num_fake_front_range": (2, 10)
+        },
+        "inference": {
+            "steps": 20,
+            "ensemble": 4,
+            "use_pmm": True,
+            "psd_ratio_threshold": 0.1,
+            "psd_samples": 64
         }
     },
     "VISUALIZATION": {
@@ -183,8 +199,8 @@ CFG = {
         "parallel_factor": 4
     },
     "VIDEO": {
-        "image_folder": "./v31_result/visualizations/",
-        "output_folder": "./v31_result/",
+        "image_folder": "./v2_result/visualizations/",
+        "output_folder": "./v2_result/",
         "frame_rate": 4,
         "low_res_scale": 4,
         "low_res_frame_rate": 2
@@ -192,7 +208,7 @@ CFG = {
     "SHAP": {
         "use_gpu": True,
         "max_samples_per_class": 500,
-        "out_root": "./v31_result/shap_stage1",
+        "out_root": "./v2_result/shap_stage1",
         "free_mem_threshold_gb": 4.0
     }
 }
@@ -203,8 +219,8 @@ if torch.cuda.is_available():
 else:
     print("GPU is not available.")
 
-def create_comparison_videos(image_folder="./v31_result/visualizations/",
-                             output_folder="./v31_result/",
+def create_comparison_videos(image_folder="./v2_result/visualizations/",
+                             output_folder="./v2_result/",
                              frame_rate=4,
                              low_res_scale=4,  
                              low_res_frame_rate=2):  
@@ -801,7 +817,7 @@ def run_stage1():
         })
         csv_path_s1 = os.path.join(model_s1_save_dir, "loss_history.csv")
         df_loss_s1.to_csv(csv_path_s1, index=False)
-        # Also place a copy in v31_result root for easy access
+        # Also place a copy in v2_result root for easy access
         try:
             root_csv_s1 = os.path.join(os.path.dirname(model_s1_save_dir), "loss_history_stage1.csv")
             df_loss_s1.to_csv(root_csv_s1, index=False)
@@ -1067,386 +1083,431 @@ class FrontalRefinementDataset(Dataset):
 
         return degraded
 
-class SwinUnetModelStage2(nn.Module):
-    def __init__(self, num_classes=6, in_chans=1, model_cfg=None):
-        super(SwinUnetModelStage2,self).__init__()
-        cfg = model_cfg if model_cfg is not None else CFG["STAGE2"]["model"]
-        self.swin_unet = SwinTransformerSys(
-            img_size=cfg["img_size"],
-            patch_size=cfg["patch_size"],
-            in_chans=in_chans,
-            num_classes=num_classes,
-            embed_dim=cfg["embed_dim"],
-            depths=cfg["depths"],
-            depths_decoder=cfg["depths_decoder"],
-            num_heads=cfg["num_heads"],
-            window_size=cfg["window_size"],
-            mlp_ratio=cfg["mlp_ratio"],
-            qkv_bias=cfg["qkv_bias"],
-            qk_scale=cfg["qk_scale"],
-            drop_rate=cfg["drop_rate"],
-            attn_drop_rate=cfg["attn_drop_rate"],
-            drop_path_rate=cfg["drop_path_rate"],
-            norm_layer=cfg["norm_layer"],
-            ape=cfg["ape"],
-            patch_norm=cfg["patch_norm"],
-            use_checkpoint=cfg["use_checkpoint"],
-            final_upsample=cfg["final_upsample"]
-        )
-    def forward(self,x):
-        return self.swin_unet(x)
+class DiffusionTrainDataset(Dataset):
+    """
+    拡散モデル学習用のunpairedデータセット
+    - 入力: 前線GT (nc_0p5_dir の各月ファイル) -> クラスマップ(0..5) -> one-hot 6ch
+    - 出力: (x_tensor, time_str)  ここで x_tensor は (6, H, W) in {0,1}
+    """
+    def __init__(self, months, nc_0p5_dir, cache_size=50):
+        self.months = months
+        self.nc_0p5_dir = nc_0p5_dir
+        self.data_index = []
+        self.lat = None
+        self.lon = None
+        self.cache = {}
+        self.cache_size = cache_size
+        self._prepare_index()
 
-def train_stage2_one_epoch(model, dataloader, optimizer, epoch, num_classes):
-    print_memory_usage(f"Before Stage2 train epoch={epoch+1}")
-    model.train()
-    running_loss = 0.0
-    total_loss = 0.0
-    correct = [0]*num_classes
-    total = [0]*num_classes
-    batch_count = 0
-
-    pbar = tqdm(dataloader, desc=f"[Stage2][Train Epoch {epoch+1}]")
-    for batch_idx, (inputs, targets, _) in enumerate(pbar):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = combined_loss(outputs, targets)
-        loss.backward()
-        optimizer.step()
-
-        loss_val = loss.item()
-        running_loss += loss_val
-        total_loss += loss_val
-        batch_count += 1
-        
-        _, predicted = torch.max(outputs, dim=1)
-        for i in range(num_classes):
-            correct[i] += ((predicted==i)&(targets==i)).sum().item()
-            total[i] += (targets==i).sum().item()
-
-        if (batch_idx+1)%10==0:
-            avg_loss_10 = running_loss/10
-            pbar.set_postfix({'Loss':f'{avg_loss_10:.4f}'})
-            running_loss=0.0
-
-    avg_epoch_loss = total_loss / max(1, batch_count)
-    print_memory_usage(f"After Stage2 train epoch={epoch+1}")
-    gc.collect()
-
-    print(f"\n[Stage2][Train Epoch {epoch+1}] Loss: {avg_epoch_loss:.4f}")
-    print(f"[Stage2][Train Epoch {epoch+1}] Accuracy by class:")
-    for i in range(num_classes):
-        acc = (correct[i]/total[i]*100) if total[i]>0 else 0
-        print(f"  Class {i}: {acc:.2f} %")
-        
-    return avg_epoch_loss
-
-def test_stage2_one_epoch(model, dataloader, epoch, num_classes):
-    print_memory_usage(f"Before Stage2 test epoch={epoch+1}")
-    model.eval()
-    test_loss=0.0
-    correct=[0]*num_classes
-    total=[0]*num_classes
-    batch_count = 0
-
-    with torch.no_grad():
-        for inputs,targets,_ in dataloader:
-            inputs,targets=inputs.to(device), targets.to(device)
-            outputs=model(inputs)
-            loss=combined_loss(outputs,targets)
-            test_loss+=loss.item()
-            batch_count += 1
-
-            _,predicted=torch.max(outputs,dim=1)
-            for i in range(num_classes):
-                correct[i]+=((predicted==i)&(targets==i)).sum().item()
-                total[i]+=(targets==i).sum().item()
-
-    print_memory_usage(f"After Stage2 test epoch={epoch+1}")
-    gc.collect()
-
-    avg_loss=test_loss / max(1, batch_count)
-    print(f"\n[Stage2][Test Epoch {epoch+1}] Loss: {avg_loss:.4f}")
-    print(f"[Stage2][Test Epoch {epoch+1}] Accuracy by class:")
-    for i in range(num_classes):
-        acc=(correct[i]/total[i]*100) if total[i]>0 else 0
-        print(f"  Class {i}: {acc:.2f} %")
-        
-    return avg_loss
-
-def evaluate_stage2(model, dataloader, save_nc_dir=None):
-    print_memory_usage("Before evaluate_stage2")
-    evaluate_start = time.time()
-    model.eval()
-    all_probs=[]
-    all_outputs=[]
-    all_targets=[]
-    all_times=[]
-    inference_start = time.time()
-    with torch.no_grad():
-        for inputs,targets,times in tqdm(dataloader,desc="[Stage2] Evaluate"):
-            inputs,targets=inputs.to(device), targets.to(device)
-            outputs=model(inputs)
-            prob=torch.softmax(outputs,dim=1)
-            pred_cls=torch.argmax(prob,dim=1)
-            all_probs.append(prob.cpu())
-            all_outputs.append(pred_cls.cpu())
-            all_targets.append(targets.cpu())
-            all_times.extend(times)
-    inference_end = time.time()
-    print(f"[Stage2] 推論処理時間: {format_time(inference_end - inference_start)}")
-    metrics_start = time.time()
-    all_probs=torch.cat(all_probs,dim=0)
-    all_outputs=torch.cat(all_outputs,dim=0)
-    all_targets=torch.cat(all_targets,dim=0)
-    if (all_targets.numpy().sum()>0):
-        pred_flat=all_outputs.view(-1).numpy()
-        targ_flat=all_targets.view(-1).numpy()
-
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            targ_flat, pred_flat, labels=list(range(CFG["STAGE2"]["num_classes"])), average=None, zero_division=0)
-        accuracy = (pred_flat==targ_flat).sum()/len(targ_flat)*100
-        print(f"\n[Stage2] Pixel Accuracy (all classes): {accuracy:.2f}%")
-        for i, cls_id in enumerate(list(range(CFG["STAGE2"]["num_classes"]))):
-            print(f"  Class{cls_id}: Precision={precision[i]:.4f}, Recall={recall[i]:.4f}, F1={f1[i]:.4f}")
-
-        cm=confusion_matrix(targ_flat,pred_flat,labels=list(range(CFG["STAGE2"]["num_classes"])))
-        plt.figure(figsize=(6,5))
-        sns.heatmap(cm,annot=True,fmt='d',cmap='Blues',
-                    xticklabels=list(range(CFG["STAGE2"]["num_classes"])),
-                    yticklabels=list(range(CFG["STAGE2"]["num_classes"])))
-        plt.title('[Stage2] Confusion Matrix')
-        plt.xlabel('Predicted')
-        plt.ylabel('Actual')
-        plt.savefig('stage2_confusion_matrix.png')
-        plt.close()
-    metrics_end = time.time()
-    print(f"[Stage2] 評価指標計算時間: {format_time(metrics_end - metrics_start)}")
-    if save_nc_dir is not None:
-        save_start = time.time()
-        os.makedirs(save_nc_dir,exist_ok=True)
-        lat=dataloader.dataset.lat
-        lon=dataloader.dataset.lon
-        for i in range(all_probs.shape[0]):
-            time_str=all_times[i]
-            probs_np=all_probs[i].numpy()
-            probs_np=np.transpose(probs_np,(1,2,0))
-            da=xr.DataArray(probs_np,dims=["lat","lon","class"],
-                            coords={"lat":lat,"lon":lon,"class":np.arange(CFG["STAGE2"]["num_classes"])})
-            ds=xr.Dataset({"probabilities":da})
-            ds=ds.expand_dims('time')
-            ds['time']=[pd.to_datetime(time_str)]
-            date_str=pd.to_datetime(time_str).strftime('%Y%m%d%H%M')
-            ds.to_netcdf(os.path.join(save_nc_dir, f"refined_{date_str}.nc"), engine='netcdf4')
-            del ds, da, probs_np
+    def _prepare_index(self):
+        for month in self.months:
+            front_file = os.path.join(self.nc_0p5_dir, f"{month}.nc")
+            if not os.path.exists(front_file):
+                print(f"{front_file} が見つかりません。スキップします。(DiffusionTrain)")
+                continue
+            ds_front = xr.open_dataset(front_file)
+            if self.lat is None or self.lon is None:
+                self.lat = ds_front['lat'].values[:ORIG_H]
+                self.lon = ds_front['lon'].values[:ORIG_W]
+            times = ds_front['time'].values
+            for t in times:
+                time_dt = pd.to_datetime(t)
+                self.data_index.append({
+                    'front_file': front_file,
+                    't': t,
+                    'time_dt': time_dt
+                })
+            ds_front.close()
+            del ds_front
             gc.collect()
-        print(f"[Stage2] Refined probabilities saved to {save_nc_dir}")
-        save_end = time.time()
-        print(f"[Stage2] 結果保存時間: {format_time(save_end - save_start)}")
+        print(f"[Stage2-Diff] 学習用インデックス: {len(self.data_index)} サンプル")
 
-    cleanup_start = time.time()
-    del all_probs, all_outputs, all_targets
-    gc.collect()
-    cleanup_end = time.time()
-    print(f"[Stage2] メモリクリーンアップ時間: {format_time(cleanup_end - cleanup_start)}")
-    
-    evaluate_end = time.time()
-    print(f"[Stage2] 評価全体の実行時間: {format_time(evaluate_end - evaluate_start)}")
-    print_memory_usage("After evaluate_stage2")
+    def __len__(self):
+        return len(self.data_index)
 
-def run_stage2():
-    print_memory_usage("Start Stage 2")
+    def _labels_to_one_hot(self, labels, num_classes=6):
+        # labels: (H, W) int64
+        oh = np.eye(num_classes, dtype=np.float32)[labels]  # (H, W, C)
+        oh = np.transpose(oh, (2, 0, 1))  # (C, H, W)
+        return oh
+
+    def __getitem__(self, idx):
+        if idx in self.cache:
+            x_tensor, time_str = self.cache[idx]
+            return x_tensor, time_str
+
+        item = self.data_index[idx]
+        front_file = item['front_file']
+        t = item['t']
+        time_dt = item['time_dt']
+
+        ds_front = xr.open_dataset(front_file)
+        front_data = ds_front.sel(time=t).to_array().values  # (5, H, W) binary
+        ds_front.close()
+
+        target_cls = np.zeros((ORIG_H, ORIG_W), dtype=np.int64)
+        for c in range(5):
+            mask = (front_data[c, :, :] == 1)
+            target_cls[mask] = c + 1  # 1..5
+        one_hot = self._labels_to_one_hot(target_cls, num_classes=CFG["STAGE2"]["num_classes"])
+        x_tensor = torch.from_numpy(one_hot).float()
+        time_str = str(time_dt)
+
+        if len(self.cache) < self.cache_size:
+            self.cache[idx] = (x_tensor, time_str)
+        return x_tensor, time_str
+
+
+class Stage1ProbDataset(Dataset):
+    """
+    Stage1 の確率出力 (prob_*.nc) を読み出す推論用データセット
+    - 出力: (prob_tensor, time_str)
+      prob_tensor: (C=6, H, W) float32 in [0,1]
+    """
+    def __init__(self, stage1_out_dir):
+        self.stage1_out_dir = stage1_out_dir
+        self.files = sorted([f for f in os.listdir(stage1_out_dir) if f.endswith('.nc') and f.startswith('prob_')])
+        self.data_index = []
+        self.lat = None
+        self.lon = None
+        for f in self.files:
+            nc_path = os.path.join(stage1_out_dir, f)
+            ds = xr.open_dataset(nc_path)
+            if self.lat is None or self.lon is None:
+                self.lat = ds['lat'].values
+                self.lon = ds['lon'].values
+            time_val = ds['time'].values[0] if 'time' in ds else None
+            time_dt = pd.to_datetime(time_val) if time_val is not None else None
+            self.data_index.append({'nc_path': nc_path, 'time_dt': time_dt})
+            ds.close()
+            del ds
+        print(f"[Stage2-Diff] 推論用インデックス: {len(self.data_index)} サンプル")
+
+    def __len__(self):
+        return len(self.data_index)
+
+    def __getitem__(self, idx):
+        item = self.data_index[idx]
+        nc_path = item['nc_path']
+        time_dt = item['time_dt']
+        ds = xr.open_dataset(nc_path)
+        probs_np = ds['probabilities'].isel(time=0).values  # (H, W, C)
+        ds.close()
+        probs_chw = np.transpose(probs_np, (2, 0, 1)).astype(np.float32)  # (C, H, W)
+        prob_tensor = torch.from_numpy(probs_chw)
+        time_str = str(time_dt) if time_dt is not None else "None"
+        return prob_tensor, time_str
+
+
+
+
+
+
+def run_stage2_diffusion():
+    """
+    Stage2 を拡散モデル（DiffusionCorrector）ベースに差し替えた学習・推論パイプライン
+    改善点:
+      - 学習ログを保存（loss_history.csv, loss_curve.png）
+      - train/val分割＋早期停止＋最良モデル保存
+      - PSDに基づく t_start 推定（S1/GTのPSD比から閾値0.1で決定）
+      - アンサンブル生成＋PMM（クラス毎に順位一致置換）→確率正規化
+    出力NetCDFは従来と同じ: probabilities[lat,lon,class], refined_*.nc
+    """
+    print_memory_usage("Start Stage 2 (Diffusion)")
     stage2_start = time.time()
+
+    # 1) 学習用データセット（train/val split）
     ds_start = time.time()
     y1, m1, y2, m2 = CFG["STAGE2"]["train_months"]
-    train_months = get_available_months(y1, m1, y2, m2)
-
-    aug = CFG["STAGE2"]["augment"]
-    train_dataset_s2=FrontalRefinementDataset(
-        months=train_months,
-        nc_0p5_dir=nc_0p5_dir,
-        mode='train',
-        stage1_out_dir=None,
-        n_augment=aug["n_augment"],
-        prob_dilation=aug["prob_dilation"],
-        prob_create_gaps=aug["prob_create_gaps"],
-        prob_random_pixel_change=aug["prob_random_pixel_change"],
-        prob_add_fake_front=aug["prob_add_fake_front"],
-        dilation_kernel_range=aug["dilation_kernel_range"],
-        num_gaps_range=aug["num_gaps_range"],
-        gap_size_range=aug["gap_size_range"],
-        num_pix_to_change_range=aug["num_pix_to_change_range"],
-        num_fake_front_range=aug["num_fake_front_range"]
-    )
-    val_dataset_s2=FrontalRefinementDataset(
-        months=train_months,
-        nc_0p5_dir=nc_0p5_dir,
-        mode='val',
-        stage1_out_dir=None,
-        n_augment=aug["n_augment"],
-        prob_dilation=aug["prob_dilation"],
-        prob_create_gaps=aug["prob_create_gaps"],
-        prob_random_pixel_change=aug["prob_random_pixel_change"],
-        prob_add_fake_front=aug["prob_add_fake_front"],
-        dilation_kernel_range=aug["dilation_kernel_range"],
-        num_gaps_range=aug["num_gaps_range"],
-        gap_size_range=aug["gap_size_range"],
-        num_pix_to_change_range=aug["num_pix_to_change_range"],
-        num_fake_front_range=aug["num_fake_front_range"]
-    )
-    train_loader_s2=DataLoader(train_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"],shuffle=True,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
-    val_loader_s2=DataLoader(val_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],shuffle=False,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
+    months = get_available_months(y1, m1, y2, m2)
+    full_dataset = DiffusionTrainDataset(months, nc_0p5_dir)
+    n_total = len(full_dataset)
+    n_val = max(1, int(0.1 * n_total))
+    n_train = n_total - n_val
+    print(f"[Stage2-Diff] Dataset total={n_total}, train={n_train}, val={n_val}")
+    g = torch.Generator().manual_seed(CFG["SEED"])
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [n_train, n_val], generator=g)
+    train_loader = DataLoader(train_dataset, batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"], shuffle=True, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
+    val_loader   = DataLoader(val_dataset,   batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],   shuffle=False, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
     ds_end = time.time()
-    print(f"[Stage2] データセット準備時間: {format_time(ds_end - ds_start)}")
-    print(f"[Stage2] Train dataset size: {len(train_dataset_s2)}")
-    print(f"[Stage2] Val   dataset size: {len(val_dataset_s2)}")
-    model_init_start = time.time()
-    model_s2=SwinUnetModelStage2(num_classes=CFG["STAGE2"]["num_classes"],in_chans=CFG["STAGE2"]["in_chans"], model_cfg=CFG["STAGE2"]["model"]).to(device)
-    optimizer_s2=optim.AdamW(model_s2.parameters(),lr=CFG["STAGE2"]["optimizer"]["lr"],weight_decay=CFG["STAGE2"]["optimizer"]["weight_decay"])
-    model_init_end = time.time()
-    print(f"[Stage2] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
-    num_epochs_stage2 = CFG["STAGE2"]["epochs"]
-    ckpt_start = time.time()
-    start_epoch=0
-    os.makedirs(model_s2_save_dir,exist_ok=True)
-    checkpoint_files=[f for f in os.listdir(model_s2_save_dir) if f.startswith('checkpoint_epoch_')]
-    if checkpoint_files:
-        checkpoint_files.sort(key=lambda x: int(re.findall(r'\d+', x)[0]))
-        latest_checkpoint=checkpoint_files[-1]
-        checkpoint_path=os.path.join(model_s2_save_dir,latest_checkpoint)
-        checkpoint=torch.load(checkpoint_path)
-        state_dict = checkpoint["model_state_dict"]
-        if any(k.startswith("module.") for k in state_dict.keys()):
-            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        model_s2.load_state_dict(state_dict)
-        optimizer_s2.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch=checkpoint['epoch']+1
-        print(f"[Stage2] 既存のチェックポイント {latest_checkpoint} から学習を再開します（エポック {start_epoch} から）")
-    else:
-        print("[Stage2] 新規に学習を開始します")
-    ckpt_end = time.time()
-    print(f"[Stage2] チェックポイント読み込み時間: {format_time(ckpt_end - ckpt_start)}")
-    train_losses = []
-    val_losses = []
+    print(f"[Stage2-Diff] データセット準備時間: {format_time(ds_end - ds_start)}")
+
+    # 2) モデル・最適化
+    DiffusionCorrector = _load_diffusion_corrector()
+    model_s2 = DiffusionCorrector(
+        image_size=ORIG_H,
+        channels=CFG["STAGE2"]["num_classes"],
+        base_dim=64,
+        dim_mults=(1, 2, 2, 2),
+        dropout=0.0,
+        objective='pred_v',
+        beta_schedule='sigmoid',
+        timesteps=1000,
+        sampling_timesteps=CFG["STAGE2"]["inference"].get("steps", 20),
+        auto_normalize=True
+    ).to(device)
+    optimizer_s2 = optim.AdamW(model_s2.parameters(), lr=CFG["STAGE2"]["optimizer"]["lr"], weight_decay=CFG["STAGE2"]["optimizer"]["weight_decay"], betas=(0.9, 0.99))
+    os.makedirs(model_s2_save_dir, exist_ok=True)
+
+    # 3) 学習ループ（train/val, 早期停止）
+    num_epochs = CFG["STAGE2"]["epochs"]
+    patience = 5
     best_val_loss = float('inf')
-    best_model_state = None
-    best_epoch = -1
+    best_state = None
+    wait = 0
+    train_losses, val_losses = [], []
+
     training_start = time.time()
-    for epoch in range(start_epoch, num_epochs_stage2):
-        epoch_start = time.time()
-        train_loss = train_stage2_one_epoch(model_s2, train_loader_s2, optimizer_s2, epoch, CFG["STAGE2"]["num_classes"])
-        val_loss = test_stage2_one_epoch(model_s2, val_loader_s2, epoch, CFG["STAGE2"]["num_classes"])
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model_s2.state_dict()
-            best_epoch = epoch
-            print(f"[Stage2] 新しい最良モデルを見つけました（エポック {epoch+1}）: 検証損失 = {val_loss:.4f}")
-        
-        epoch_end = time.time()
-        print(f"[Stage2] エポック {epoch+1} 実行時間: {format_time(epoch_end - epoch_start)}")
-        save_start = time.time()
-        checkpoint = {
+    for epoch in range(num_epochs):
+        print_memory_usage(f"Before Stage2-Diff train epoch={epoch+1}")
+        # train
+        model_s2.train()
+        running, count = 0.0, 0
+        pbar = tqdm(train_loader, desc=f"[Stage2-Diff][Train Epoch {epoch+1}]")
+        for x, _t in pbar:
+            x = x.to(device)
+            optimizer_s2.zero_grad()
+            loss = model_s2(x)
+            loss.backward()
+            optimizer_s2.step()
+            val = float(loss.item()); running += val; count += 1
+            if count % 10 == 0:
+                pbar.set_postfix({'Loss': f"{(running / count):.4f}"})
+        avg_train = running / max(1, count)
+        train_losses.append(avg_train)
+
+        # val
+        model_s2.eval()
+        v_running, v_count = 0.0, 0
+        with torch.no_grad():
+            for x, _t in DataLoader(val_dataset, batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"], shuffle=False, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"]):
+                x = x.to(device)
+                v_loss = model_s2(x)
+                v_running += float(v_loss.item())
+                v_count += 1
+        avg_val = v_running / max(1, v_count)
+        val_losses.append(avg_val)
+        print(f"[Stage2-Diff][Epoch {epoch+1}] train_loss={avg_train:.4f} val_loss={avg_val:.4f}")
+
+        # checkpoint + best
+        ckpt = {
             'epoch': epoch,
             'model_state_dict': model_s2.state_dict(),
             'optimizer_state_dict': optimizer_s2.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss
+            'train_loss': avg_train,
+            'val_loss': avg_val
         }
-
-        checkpoint_path = os.path.join(model_s2_save_dir, f'checkpoint_epoch_{epoch}.pth')
-        torch.save(checkpoint, checkpoint_path)
-        print(f"[Stage2] チェックポイントを保存しました: checkpoint_epoch_{epoch}.pth")
+        ckpt_path = os.path.join(model_s2_save_dir, f'diffusion_checkpoint_epoch_{epoch}.pth')
+        torch.save(ckpt, ckpt_path)
         if epoch > 0:
-            previous_checkpoint_path = os.path.join(model_s2_save_dir, f'checkpoint_epoch_{epoch - 1}.pth')
-            if os.path.exists(previous_checkpoint_path):
-                os.remove(previous_checkpoint_path)
-                print(f"[Stage2] 前回のチェックポイントを削除しました: checkpoint_epoch_{epoch - 1}.pth")
-        save_end = time.time()
-        print(f"[Stage2] チェックポイント保存時間: {format_time(save_end - save_start)}")
-    
-    training_end = time.time()
-    print(f"[Stage2] 学習ループ全体の実行時間: {format_time(training_end - training_start)}")
-    final_save_start = time.time()
-    if best_model_state is not None:
-        torch.save(best_model_state, os.path.join(model_s2_save_dir, 'model_final.pth'))
-        print(f"[Stage2] 最良モデル（エポック {best_epoch+1}）を model_final.pth として保存しました")
+            prev = os.path.join(model_s2_save_dir, f'diffusion_checkpoint_epoch_{epoch-1}.pth')
+            if os.path.exists(prev):
+                os.remove(prev)
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_state = {k: v.cpu() for k, v in model_s2.state_dict().items()}
+            wait = 0
+            print(f"[Stage2-Diff] New best at epoch {epoch+1}: val_loss={avg_val:.4f}")
+        else:
+            wait += 1
+            print(f"[Stage2-Diff] No improvement ({wait}/{patience})")
+            if wait >= patience:
+                print("[Stage2-Diff] Early stopping")
+                break
+
+        print_memory_usage(f"After Stage2-Diff train epoch={epoch+1}")
+        gc.collect()
+
+    # 保存（最良／最終）
+    if best_state is not None:
+        torch.save(best_state, os.path.join(model_s2_save_dir, 'diffusion_model_final.pth'))
+        model_s2.load_state_dict(best_state)
+        print(f"[Stage2-Diff] 最良モデルを保存: diffusion_model_final.pth")
     else:
-        torch.save(model_s2.state_dict(), os.path.join(model_s2_save_dir, 'model_final.pth'))
-        print(f"[Stage2] 最終的なモデルを保存しました: model_final.pth")
-    
+        torch.save(model_s2.state_dict(), os.path.join(model_s2_save_dir, 'diffusion_model_final.pth'))
+        print(f"[Stage2-Diff] 最終モデルを保存: diffusion_model_final.pth")
+
+    # 学習ログの可視化・保存
     if len(train_losses) > 0:
         plt.figure(figsize=(10, 6))
-        epochs = list(range(start_epoch + 1, start_epoch + len(train_losses) + 1))
-        plt.plot(epochs, train_losses, 'b-', label='Train Loss')
-        plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
-        if best_epoch >= 0:
-            plt.axvline(x=best_epoch+1, color='g', linestyle='--', label=f'Best Epoch ({best_epoch+1})')
-            
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Stage2 Training and Validation Loss')
-        plt.legend()
-        plt.grid(True)
-        min_loss = min(min(train_losses), min(val_losses))
-        max_loss = max(max(train_losses), max(val_losses))
+        epochs_axis = list(range(1, len(train_losses) + 1))
+        plt.plot(epochs_axis, train_losses, 'b-', label='Train Loss')
+        plt.plot(epochs_axis, val_losses, 'r-', label='Val Loss')
+        best_epoch = int(np.argmin(val_losses)) + 1 if len(val_losses) > 0 else 1
+        plt.axvline(x=best_epoch, color='g', linestyle='--', label=f'Best Epoch ({best_epoch})')
+        plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.title('Stage2-Diff Training / Val Loss'); plt.legend(); plt.grid(True)
+        min_loss = min(min(train_losses), min(val_losses)); max_loss = max(max(train_losses), max(val_losses))
         margin = (max_loss - min_loss) * 0.1
         plt.ylim([max(0, min_loss - margin), max_loss + margin])
-        
         loss_curve_path = os.path.join(model_s2_save_dir, 'loss_curve.png')
-        plt.savefig(loss_curve_path)
-        plt.close()
-        print(f"[Stage2] Loss曲線を保存しました: {loss_curve_path}")
-        # Save loss history as CSV for logging
+        plt.savefig(loss_curve_path); plt.close()
+        print(f"[Stage2-Diff] Loss曲線を保存: {loss_curve_path}")
+        df_loss = pd.DataFrame({"epoch": epochs_axis, "train_loss": train_losses, "val_loss": val_losses})
+        csv_path = os.path.join(model_s2_save_dir, "loss_history.csv")
+        df_loss.to_csv(csv_path, index=False)
         try:
-            epochs_col = epochs
-        except NameError:
-            epochs_col = list(range(1, len(train_losses) + 1))
-        df_loss_s2 = pd.DataFrame({
-            "epoch": epochs_col,
-            "train_loss": train_losses,
-            "val_loss": val_losses
-        })
-        csv_path_s2 = os.path.join(model_s2_save_dir, "loss_history.csv")
-        df_loss_s2.to_csv(csv_path_s2, index=False)
-        # Also place a copy in v31_result root for easy access
-        try:
-            root_csv_s2 = os.path.join(os.path.dirname(model_s2_save_dir), "loss_history_stage2.csv")
-            df_loss_s2.to_csv(root_csv_s2, index=False)
-        except Exception as e:
-            print(f"[Stage2] Loss history CSV copy skipped: {e}")
-    
-    final_save_end = time.time()
-    print(f"[Stage2] 最終モデル保存時間: {format_time(final_save_end - final_save_start)}")
+            root_csv = os.path.join(os.path.dirname(model_s2_save_dir), "loss_history_stage2_diff.csv")
+            df_loss.to_csv(root_csv, index=False)
+        except Exception:
+            pass
+
+    # 4) 推論（PSDに基づく t_start 推定 → アンサンブル＋PMM）
+    def _psd_1d_x(arr2d: np.ndarray) -> np.ndarray:
+        # arr2d: (H, W) → FFT along x (lon=W)
+        H, W = arr2d.shape
+        f = np.fft.rfft(arr2d, axis=1)  # (H, W//2+1)
+        psd = (f * np.conj(f)).real  # power
+        return psd.mean(axis=0)  # average over y
+
+    def _get_gt_onehot_for_time(time_str: str):
+        month_str = time_str[:6]
+        gt_file = os.path.join(nc_0p5_dir, f"{month_str}.nc")
+        if not os.path.exists(gt_file):
+            return None
+        ds = xr.open_dataset(gt_file)
+        t_dt = pd.to_datetime(time_str, format='%Y%m%d%H%M')
+        if t_dt in ds['time']:
+            front_data = ds.sel(time=t_dt).to_array().values  # (5,H,W)
+        else:
+            diff_ = np.abs(ds['time'].values - np.datetime64(t_dt))
+            idx_ = diff_.argmin()
+            if diff_[idx_] <= np.timedelta64(3, 'h'):
+                front_data = ds.sel(time=ds['time'][idx_]).to_array().values
+            else:
+                ds.close(); return None
+        ds.close()
+        H, W = front_data.shape[1], front_data.shape[2]
+        target_cls = np.zeros((H, W), dtype=np.int64)
+        for c in range(5):
+            mask = (front_data[c] == 1)
+            target_cls[mask] = c + 1
+        # one-hot 6ch
+        oh = np.eye(CFG["STAGE2"]["num_classes"], dtype=np.float32)[target_cls]  # (H,W,C)
+        oh = np.transpose(oh, (2, 0, 1))  # (C,H,W)
+        return oh
+
+    # 推定サンプル数・閾値
+    psd_thresh = CFG["STAGE2"]["inference"].get("psd_ratio_threshold", 0.1)
+    psd_samples = CFG["STAGE2"]["inference"].get("psd_samples", 64)
+    # Stage1結果からサンプル
+    s1_ds = Stage1ProbDataset(stage1_out_dir)
+    sample_count = min(len(s1_ds), psd_samples)
+    k_hits = []
+    for idx in range(sample_count):
+        prob_tensor, t_str = s1_ds[idx]
+        probs = prob_tensor.numpy()  # (C,H,W)
+        gt_oh = _get_gt_onehot_for_time(pd.to_datetime(t_str).strftime('%Y%m%d%H%M'))
+        if gt_oh is None:
+            continue
+        C, H, W = probs.shape
+        kmax = W // 2
+        # クラス毎にPSD比を見る（クラス0は背景のため1..5を重視）
+        for c in range(1, min(C, 6)):
+            psd_pred = _psd_1d_x(probs[c])
+            psd_gt   = _psd_1d_x(gt_oh[c])
+            eps = 1e-12
+            ratio = psd_pred / (psd_gt + eps)
+            ks = np.where(ratio < psd_thresh)[0]
+            if ks.size > 0:
+                k_hits.append(int(ks[0]))
+    if len(k_hits) == 0:
+        print("[Stage2-Diff][PSD] 閾値を満たすkが見つからず、既定の t_start=T//2 を採用します。")
+        t_start = model_s2.num_timesteps // 2
+    else:
+        k_star = int(np.median(k_hits))
+        kmax = (s1_ds.lon.size) // 2
+        frac = np.clip(k_star / max(1, kmax), 0.0, 1.0)
+        t_start = int(frac * (model_s2.num_timesteps - 1))
+        print(f"[Stage2-Diff][PSD] median k*={k_star} (kmax={kmax}) → t_start={t_start}/{model_s2.num_timesteps-1}")
+
+    # アンサンブル＋PMM設定
+    steps = CFG["STAGE2"]["inference"].get("steps", 20)
+    ensemble = CFG["STAGE2"]["inference"].get("ensemble", 4)
+    use_pmm = CFG["STAGE2"]["inference"].get("use_pmm", True)
+
+    def _pmm_per_class(samples_ec_hw: np.ndarray) -> np.ndarray:
+        """
+        samples_ec_hw: (E, C, H, W) の確率（0..1）
+        クラス毎に PMM（Probability Matched Mean）を適用して (C,H,W) を返す。
+        実装方針:
+          - 各クラス c について、全サンプルの画素値 S を昇順に整列（長さ = E*H*W）
+          - 平均場 M = mean(samples, axis=0) を用いて画素の順位を求める（長さ = H*W）
+          - H*W 個の順位に対し、S_sorted から均等間隔の H*W 個を割り当て（長さ不一致を回避）
+        """
+        E, C, H, W = samples_ec_hw.shape
+        out = np.zeros((C, H, W), dtype=np.float32)
+        hw = H * W
+        for c in range(C):
+            # すべてのサンプル画素を 1 次元に並べ替えて昇順にする（E*H*W）
+            S_sorted = np.sort(samples_ec_hw[:, c, :, :].reshape(-1))
+
+            # 平均場（H,W）とその順位（低→高）を求める
+            M = samples_ec_hw[:, c, :, :].mean(axis=0)         # (H,W)
+            M_flat = M.reshape(-1)                              # (H*W,)
+            order = np.argsort(M_flat)                          # 低→高
+
+            # S_sorted から H*W 個を等間隔にサンプリングして、M_flat の順位に割り当てる
+            # 例：H*W=16384, E*H*W=65536 → 間引きして 16384 個を使用
+            idx_S = np.linspace(0, S_sorted.size - 1, num=hw).astype(int)  # (H*W,)
+            mapped_flat = np.empty(hw, dtype=np.float32)
+            mapped_flat[order] = S_sorted[idx_S]               # 順位に応じて値を割当て
+            out[c] = mapped_flat.reshape(H, W)
+
+        # チャネル正規化
+        out = np.clip(out, 0.0, 1.0)
+        denom = out.sum(axis=0, keepdims=True) + 1e-8
+        return out / denom
+
+    # 推論実行
     eval_start = time.time()
-    test_dataset_s2=FrontalRefinementDataset(
-        months=None,
-        nc_0p5_dir=nc_0p5_dir,
-        mode='test',
-        stage1_out_dir=stage1_out_dir
-    )
-    test_loader_s2=DataLoader(test_dataset_s2,batch_size=CFG["STAGE2"]["dataloader"]["batch_size_test"],shuffle=False,num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
-    print(f"[Stage2] Test dataset size (Stage1結果): {len(test_dataset_s2)}")
-    if best_model_state is not None:
-        model_s2.load_state_dict(best_model_state)
-        print(f"[Stage2] 評価のために最良モデル（エポック {best_epoch+1}）をロードしました")
-    
-    evaluate_stage2(model_s2, test_loader_s2, save_nc_dir=stage2_out_dir)
+    infer_loader = DataLoader(s1_ds, batch_size=CFG["STAGE2"]["dataloader"]["batch_size_test"], shuffle=False, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
+    os.makedirs(stage2_out_dir, exist_ok=True)
+    lat, lon = s1_ds.lat, s1_ds.lon
+
+    model_s2.eval()
+    with torch.no_grad():
+        for prob_tensor, time_str in tqdm(infer_loader, desc="[Stage2-Diff] Inference+PMM"):
+            # prob_tensor: (B, C, H, W)
+            prob_tensor = prob_tensor.to(device)
+            refined = model_s2.correct_from_probs(prob_tensor, steps=steps, t_start=t_start, ensemble=ensemble)  # (E*B, C, H, W)
+            # 形状: (E, B, C, H, W)
+            C = refined.shape[1]
+            E = ensemble
+            B = prob_tensor.shape[0]
+            refined = refined.view(E, B, C, ORIG_H, ORIG_W).cpu().numpy()
+            # PMM or ensemble-mean
+            for b in range(B):
+                if use_pmm:
+                    out_chw = _pmm_per_class(refined[:, b])  # (C,H,W)
+                else:
+                    out_chw = refined[:, b].mean(axis=0)
+                    denom = out_chw.sum(axis=0, keepdims=True) + 1e-8
+                    out_chw = out_chw / denom
+                probs_np = np.transpose(out_chw, (1, 2, 0))  # (H,W,C)
+                da = xr.DataArray(probs_np, dims=["lat", "lon", "class"], coords={"lat": lat, "lon": lon, "class": np.arange(CFG["STAGE2"]["num_classes"])})
+                ds = xr.Dataset({"probabilities": da})
+                ds = ds.expand_dims('time')
+                t_dt = pd.to_datetime(time_str[b])
+                ds['time'] = [t_dt]
+                date_str = t_dt.strftime('%Y%m%d%H%M')
+                out_path = os.path.join(stage2_out_dir, f"refined_{date_str}.nc")
+                ds.to_netcdf(out_path, engine='netcdf4')
+                del ds, da, probs_np
+                gc.collect()
     eval_end = time.time()
-    print(f"[Stage2] 評価時間: {format_time(eval_end - eval_start)}")
-    cleanup_start = time.time()
-    del train_dataset_s2, val_dataset_s2, train_loader_s2, val_loader_s2
-    del test_dataset_s2, test_loader_s2
+    print(f"[Stage2-Diff] 推論時間: {format_time(eval_end - eval_start)}  (steps={steps}, ensemble={ensemble}, PMM={use_pmm})")
+
+    # 後処理
+    del full_dataset, train_dataset, val_dataset, train_loader, val_loader, s1_ds, infer_loader
     del model_s2, optimizer_s2
-    torch.cuda.empty_cache()
-    gc.collect()
-    cleanup_end = time.time()
-    print(f"[Stage2] メモリクリーンアップ時間: {format_time(cleanup_end - cleanup_start)}")
+    torch.cuda.empty_cache(); gc.collect()
 
     stage2_end = time.time()
-    print(f"[Stage2] 全体の実行時間: {format_time(stage2_end - stage2_start)}")
-    print_memory_usage("After Stage 2")
+    print(f"[Stage2-Diff] 全体の実行時間: {format_time(stage2_end - stage2_start)}")
+    print_memory_usage("After Stage 2 (Diffusion)")
+
+
 
 def evaluate_stage3(stage2_nc_dir, save_nc_dir):
     print_memory_usage("Before evaluate_stage3")
@@ -2084,14 +2145,14 @@ def run_evaluation():
     fig.text(0.5, 0.005, summary_text, ha='center', va='bottom', fontsize=10)
     
     plt.tight_layout(rect=[0, 0.05, 1, 1])
-    out_fig = "v31_result/evaluation_summary.png"
+    out_fig = "v2_result/evaluation_summary.png"
     plt.savefig(out_fig, dpi=300)
     plt.close()
     # Write detailed text-based summary log
     try:
-        v31_root = os.path.dirname(CFG["PATHS"]["output_visual_dir"])
-        os.makedirs(v31_root, exist_ok=True)
-        log_path = os.path.join(v31_root, "evaluation_summary.log")
+        v2_root = os.path.dirname(CFG["PATHS"]["output_visual_dir"])
+        os.makedirs(v2_root, exist_ok=True)
+        log_path = os.path.join(v2_root, "evaluation_summary.log")
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("=== Evaluation Summary ===\n")
             f.write(f"Generated at: {datetime.now()}\n")
@@ -2375,7 +2436,7 @@ def _safe_shap(expl,x,ns=16):
             print(f"[SHAP] OOM → nsamples={ns} で再試行"); torch.cuda.empty_cache()
 def run_stage1_shap_evaluation_cpu(use_gpu=True,
                                    max_samples_per_class=500,
-                                   out_root="./v31_result/shap_stage1"):
+                                   out_root="./v2_result/shap_stage1"):
     print("\n========== Stage-1 SHAP 解析 ==========")
     months=get_available_months(2023,1,2023,12)
     ds = FrontalDatasetStage1(months, nc_gsm_dir, nc_0p5_dir)
@@ -2445,7 +2506,7 @@ def main():
     shap_end = time.time()
     print(f"Stage1 SHAP分析 実行時間: {format_time(shap_end - shap_start)}")
     stage2_start = time.time()
-    run_stage2()
+    run_stage2_diffusion()
     stage2_end = time.time()
     print(f"Stage2 実行時間: {format_time(stage2_end - stage2_start)}")
     stage3_start = time.time()
