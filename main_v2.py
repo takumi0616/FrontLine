@@ -1227,8 +1227,22 @@ def run_stage2_diffusion():
     print(f"[Stage2-Diff] Dataset total={n_total}, train={n_train}, val={n_val}")
     g = torch.Generator().manual_seed(CFG["SEED"])
     train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [n_train, n_val], generator=g)
-    train_loader = DataLoader(train_dataset, batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"], shuffle=True, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
-    val_loader   = DataLoader(val_dataset,   batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],   shuffle=False, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"])
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"],
+        shuffle=True,
+        num_workers=CFG["STAGE2"]["dataloader"]["num_workers"],
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=CFG["STAGE2"]["dataloader"]["num_workers"] > 0
+    )
+    val_loader   = DataLoader(
+        val_dataset,
+        batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],
+        shuffle=False,
+        num_workers=CFG["STAGE2"]["dataloader"]["num_workers"],
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=CFG["STAGE2"]["dataloader"]["num_workers"] > 0
+    )
     ds_end = time.time()
     print(f"[Stage2-Diff] データセット準備時間: {format_time(ds_end - ds_start)}")
 
@@ -1249,6 +1263,33 @@ def run_stage2_diffusion():
     optimizer_s2 = optim.AdamW(model_s2.parameters(), lr=CFG["STAGE2"]["optimizer"]["lr"], weight_decay=CFG["STAGE2"]["optimizer"]["weight_decay"], betas=(0.9, 0.99))
     os.makedirs(model_s2_save_dir, exist_ok=True)
 
+    # ===== Resume support for Stage2-Diffusion =====
+    start_epoch = 0
+    try:
+        ckpt_files = [f for f in os.listdir(model_s2_save_dir)
+                      if f.startswith('diffusion_checkpoint_epoch_') and f.endswith('.pth')]
+        if ckpt_files:
+            ckpt_files.sort(key=lambda x: int(re.findall(r'\d+', x)[0]))
+            latest_ckpt = ckpt_files[-1]
+            ckpt_path = os.path.join(model_s2_save_dir, latest_ckpt)
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            # load model state (support both raw state_dict or wrapped dict)
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                model_s2.load_state_dict(ckpt['model_state_dict'])
+            else:
+                model_s2.load_state_dict(ckpt)
+            # load optimizer state if available
+            if isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
+                optimizer_s2.load_state_dict(ckpt['optimizer_state_dict'])
+            # next epoch index
+            start_epoch = int(ckpt.get('epoch', -1)) + 1 if isinstance(ckpt, dict) else 0
+            print(f"[Stage2-Diff] 既存チェックポイント {latest_ckpt} から学習を再開します（エポック {start_epoch} から）")
+        else:
+            print("[Stage2-Diff] 新規に学習を開始します")
+    except Exception as e:
+        print(f"[Stage2-Diff][WARN] チェックポイント読み込みに失敗しました（新規学習にフォールバック）: {e}")
+    # ===============================================
+
     # 3) 学習ループ（train/val, 早期停止）
     num_epochs = CFG["STAGE2"]["epochs"]
     patience = 5
@@ -1258,21 +1299,38 @@ def run_stage2_diffusion():
     train_losses, val_losses = [], []
 
     training_start = time.time()
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print_memory_usage(f"Before Stage2-Diff train epoch={epoch+1}")
         # train
         model_s2.train()
         running, count = 0.0, 0
         pbar = tqdm(train_loader, desc=f"[Stage2-Diff][Train Epoch {epoch+1}]")
         for x, _t in pbar:
-            x = x.to(device)
-            optimizer_s2.zero_grad()
-            loss = model_s2(x)
-            loss.backward()
-            optimizer_s2.step()
-            val = float(loss.item()); running += val; count += 1
-            if count % 10 == 0:
-                pbar.set_postfix({'Loss': f"{(running / count):.4f}"})
+            try:
+                x = x.to(device, non_blocking=True)
+                optimizer_s2.zero_grad(set_to_none=True)
+                loss = model_s2(x)
+                # 数値異常を検知したらスキップ
+                if not torch.isfinite(loss):
+                    print(f"[Stage2-Diff][WARN] Non-finite loss detected (epoch {epoch+1}, count {count}). Skipped batch.")
+                    continue
+                loss.backward()
+                # 勾配クリップで数値安定化
+                torch.nn.utils.clip_grad_norm_(model_s2.parameters(), max_norm=1.0)
+                optimizer_s2.step()
+                # ここで同期すると、非同期CUDAエラーを早期に捕捉できる
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                val = float(loss.detach().item()); running += val; count += 1
+                if count % 10 == 0:
+                    pbar.set_postfix({'Loss': f"{(running / count):.4f}"})
+            except RuntimeError as e:
+                # 典型: 非同期CUDAカーネルエラー（unknown error等）
+                print(f"[Stage2-Diff][ERROR] Caught RuntimeError at epoch {epoch+1}, count {count}: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # バッチをスキップして継続（再発する場合は CUDA_LAUNCH_BLOCKING=1 で再実行を推奨）
+                continue
         avg_train = running / max(1, count)
         train_losses.append(avg_train)
 
@@ -1280,10 +1338,14 @@ def run_stage2_diffusion():
         model_s2.eval()
         v_running, v_count = 0.0, 0
         with torch.no_grad():
-            for x, _t in DataLoader(val_dataset, batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"], shuffle=False, num_workers=CFG["STAGE2"]["dataloader"]["num_workers"]):
-                x = x.to(device)
+            for x, _t in val_loader:
+                x = x.to(device, non_blocking=True)
                 v_loss = model_s2(x)
-                v_running += float(v_loss.item())
+                if not torch.isfinite(v_loss):
+                    continue
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                v_running += float(v_loss.detach().item())
                 v_count += 1
         avg_val = v_running / max(1, v_count)
         val_losses.append(avg_val)
@@ -1316,6 +1378,8 @@ def run_stage2_diffusion():
                 print("[Stage2-Diff] Early stopping")
                 break
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print_memory_usage(f"After Stage2-Diff train epoch={epoch+1}")
         gc.collect()
 
