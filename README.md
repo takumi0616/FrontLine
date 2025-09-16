@@ -17,13 +17,13 @@
 ## コマンド
 
 ```bash
-notify-run wsl-ubuntu -- nohup python main_v2.py > output_v2.log 2>&1 &
+notify-run wsl-ubuntu -- nohup python main_v3.py > output_v3.log 2>&1 &
 ```
 
 タスクの削除
 
 ```bash
-pkill -f "main.py"
+pkill -f "main_v3.py"
 ```
 
 権利を takumi ユーザーに指定
