@@ -21,14 +21,42 @@ from main_v3_datasets import Stage2DiffusionTrainDataset, Stage2DiffusionTestDat
 
 def _load_diffusion_corrector():
     """
-    Load DiffusionCorrector class from local diffusion-model.py placed in the same directory.
+    Load DiffusionCorrector class from diffusion-model.py.
+
+    Search order:
+      1) src/FrontLine/main_v3/diffusion-model.py        (same dir as this file)
+      2) src/FrontLine/diffusion-model.py                (parent dir)
+      3) Absolute fallback: /home/takumi/docker_miniconda/src/FrontLine/diffusion-model.py
+
+    Raises:
+      FileNotFoundError if none are found.
     """
-    mod_path = Path(__file__).parent / "diffusion-model.py"
-    spec = _ilu.spec_from_file_location("diffusion_corrector_mod", str(mod_path))
-    module = _ilu.module_from_spec(spec)
-    assert spec is not None and spec.loader is not None, "Failed to build spec for diffusion-model.py"
-    spec.loader.exec_module(module)
-    return module.DiffusionCorrector
+    candidates = [
+        Path(__file__).parent / "diffusion-model.py",
+        Path(__file__).parent.parent / "diffusion-model.py",
+        Path("/home/takumi/docker_miniconda/src/FrontLine/diffusion-model.py"),
+    ]
+    last_error = None
+    for mod_path in candidates:
+        try:
+            if not mod_path.exists():
+                continue
+            spec = _ilu.spec_from_file_location("diffusion_corrector_mod", str(mod_path))
+            if spec is None or spec.loader is None:
+                continue
+            module = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            # verify attribute exists
+            if hasattr(module, "DiffusionCorrector"):
+                return module.DiffusionCorrector
+        except Exception as e:
+            last_error = e
+            continue
+    raise FileNotFoundError(
+        "diffusion-model.py not found or invalid. Tried:\n  - " +
+        "\n  - ".join(str(p) for p in candidates) +
+        (f"\nLast error: {last_error}" if last_error else "")
+    )
 
 
 def run_stage2_diffusion():
