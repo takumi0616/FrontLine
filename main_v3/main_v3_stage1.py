@@ -195,8 +195,20 @@ def run_stage1():
     y1, m1, y2, m2 = CFG["STAGE1"]["test_months"]
     test_months = get_available_months(y1, m1, y2, m2)
 
-    train_dataset_s1 = FrontalDatasetStage1(train_months, nc_gsm_dir, nc_0p5_dir)
-    test_dataset_s1 = FrontalDatasetStage1(test_months, nc_gsm_dir, nc_0p5_dir)
+    train_dataset_s1 = FrontalDatasetStage1(
+        train_months,
+        nc_gsm_dir,
+        nc_0p5_dir,
+        cache_size=CFG["STAGE1"].get("dataset_cache_size", 50),           # サンプルキャッシュ上限（個）
+        file_cache_size=CFG["STAGE1"].get("file_cache_size", 10),          # オープン済みNetCDFファイルのキャッシュ上限（個）
+    )
+    test_dataset_s1 = FrontalDatasetStage1(
+        test_months,
+        nc_gsm_dir,
+        nc_0p5_dir,
+        cache_size=CFG["STAGE1"].get("dataset_cache_size", 50),           # サンプルキャッシュ上限（個）
+        file_cache_size=CFG["STAGE1"].get("file_cache_size", 10),          # オープン済みNetCDFファイルのキャッシュ上限（個）
+    )
     train_loader_s1 = DataLoader(
         train_dataset_s1,
         batch_size=CFG["STAGE1"]["dataloader"]["batch_size_train"],
@@ -227,6 +239,7 @@ def run_stage1():
         model_s1.parameters(),
         lr=CFG["STAGE1"]["optimizer"]["lr"],
         weight_decay=CFG["STAGE1"]["optimizer"]["weight_decay"],
+        betas=tuple(CFG["STAGE1"]["optimizer"].get("betas", (0.9, 0.999)))  # AdamWのβ（慣性項）
     )
     model_init_end = time.time()
     print(f"[Stage1] モデル初期化時間: {format_time(model_init_end - model_init_start)}")

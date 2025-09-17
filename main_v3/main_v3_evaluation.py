@@ -216,15 +216,16 @@ def compute_distance_stats(
 
 
 def run_evaluation():
-    print("[Evaluation] Start evaluation for 2023 data (6 classes).")
+    year = CFG.get("EVAL", {}).get("year", 2023)
+    print(f"[Evaluation] Start evaluation for {year} data (6 classes).")
 
     ratio_buf_s1 = {c: [] for c in range(1, CFG["STAGE1"]["num_classes"])}
     ratio_buf_s2 = {c: [] for c in range(1, CFG["STAGE1"]["num_classes"])}
     ratio_buf_s3 = {c: [] for c in range(1, CFG["STAGE1"]["num_classes"])}
 
-    stage1_files = sorted([f for f in os.listdir(stage1_out_dir) if f.startswith("prob_2023") and f.endswith(".nc")])
-    stage2_files = sorted([f for f in os.listdir(stage2_out_dir) if f.startswith("refined_2023") and f.endswith(".nc")])
-    stage3_files = sorted([f for f in os.listdir(stage3_out_dir) if f.startswith("skeleton_2023") and f.endswith(".nc")])
+    stage1_files = sorted([f for f in os.listdir(stage1_out_dir) if f.startswith(f"prob_{year}") and f.endswith(".nc")])
+    stage2_files = sorted([f for f in os.listdir(stage2_out_dir) if f.startswith(f"refined_{year}") and f.endswith(".nc")])
+    stage3_files = sorted([f for f in os.listdir(stage3_out_dir) if f.startswith(f"skeleton_{year}") and f.endswith(".nc")])
 
     stage1_dict = {}
     stage2_dict = {}
@@ -248,7 +249,7 @@ def run_evaluation():
     any_prob_s2_list = []
     y_true_front_list = []
     if len(common_keys) == 0:
-        print("[Evaluation] Not found any 2023 common times among stage1/2/3.")
+        print(f"[Evaluation] Not found any {year} common times among stage1/2/3.")
         return
 
     stage1_pred_list = []
@@ -396,6 +397,84 @@ def run_evaluation():
         rmse_s2_cls[c] = np.sqrt(np.mean((pred_s2_bin - gt_bin) ** 2))
         rmse_s3_cls[c] = np.sqrt(np.mean((pred_s3_bin - gt_bin) ** 2))
 
+    # --- Extra summary stats for figure/log ---
+    try:
+        # Compute AUC/AP (Front vs None) in-place for summary embedding
+        if len(y_true_front_list) > 0:
+            y_true_front_all_fig = np.concatenate(y_true_front_list, axis=0)
+            any_prob_s1_all_fig = np.concatenate(any_prob_s1_list, axis=0)
+            any_prob_s2_all_fig = np.concatenate(any_prob_s2_list, axis=0)
+            mask_valid_fig = np.isfinite(any_prob_s1_all_fig) & np.isfinite(any_prob_s2_all_fig)
+            y_true_front_all_fig = y_true_front_all_fig[mask_valid_fig]
+            any_prob_s1_all_fig = any_prob_s1_all_fig[mask_valid_fig]
+            any_prob_s2_all_fig = any_prob_s2_all_fig[mask_valid_fig]
+            auc_s1_fig = roc_auc_score(y_true_front_all_fig, any_prob_s1_all_fig) if y_true_front_all_fig.sum() > 0 else float("nan")
+            auc_s2_fig = roc_auc_score(y_true_front_all_fig, any_prob_s2_all_fig) if y_true_front_all_fig.sum() > 0 else float("nan")
+            ap_s1_fig = average_precision_score(y_true_front_all_fig, any_prob_s1_all_fig) if y_true_front_all_fig.sum() > 0 else float("nan")
+            ap_s2_fig = average_precision_score(y_true_front_all_fig, any_prob_s2_all_fig) if y_true_front_all_fig.sum() > 0 else float("nan")
+        else:
+            auc_s1_fig = auc_s2_fig = ap_s1_fig = ap_s2_fig = float("nan")
+    except Exception:
+        auc_s1_fig = auc_s2_fig = ap_s1_fig = ap_s2_fig = float("nan")
+
+    # Precompute seasonal and distance CSVs to allow summary inclusion
+    try:
+        compute_seasonal_crossing_rates(
+            stage3_out_dir,
+            out_csv_month=os.path.join(os.path.dirname(output_visual_dir), "seasonal_monthly_rates.csv"),
+            out_csv_season=os.path.join(os.path.dirname(output_visual_dir), "seasonal_rates.csv"),
+        )
+    except Exception:
+        pass
+    try:
+        compute_distance_stats(
+            stage3_out_dir,
+            nc_0p5_dir,
+            out_csv=os.path.join(os.path.dirname(output_visual_dir), "distance_stats.csv"),
+        )
+    except Exception:
+        pass
+
+    # Read seasonal / distance summaries if available
+    seasonal_month_csv = os.path.join(os.path.dirname(output_visual_dir), "seasonal_monthly_rates.csv")
+    seasonal_csv = os.path.join(os.path.dirname(output_visual_dir), "seasonal_rates.csv")
+    distance_csv = os.path.join(os.path.dirname(output_visual_dir), "distance_stats.csv")
+
+    seasonal_month_mean = None
+    seasonal_means_by_season = None
+    dist_mean_mean = dist_median_mean = dist_p90_mean = None
+
+    try:
+        if os.path.exists(seasonal_month_csv):
+            dfm = pd.read_csv(seasonal_month_csv)
+            if "rate_mean" in dfm.columns and len(dfm) > 0:
+                seasonal_month_mean = float(np.mean(dfm["rate_mean"]))
+    except Exception:
+        seasonal_month_mean = None
+
+    try:
+        if os.path.exists(seasonal_csv):
+            dfs = pd.read_csv(seasonal_csv)
+            if {"season", "rate_mean"}.issubset(set(dfs.columns)) and len(dfs) > 0:
+                seasonal_means_by_season = {
+                    s: float(np.mean(dfs.loc[dfs["season"] == s, "rate_mean"]))
+                    for s in ["DJF", "MAM", "JJA", "SON"]
+                    if (dfs["season"] == s).any()
+                }
+    except Exception:
+        seasonal_means_by_season = None
+
+    try:
+        if os.path.exists(distance_csv):
+            dfd = pd.read_csv(distance_csv)
+            if {"mean_km", "median_km", "p90_km"}.issubset(set(dfd.columns)) and len(dfd) > 0:
+                dist_mean_mean = float(np.mean(dfd["mean_km"]))
+                dist_median_mean = float(np.mean(dfd["median_km"]))
+                dist_p90_mean = float(np.mean(dfd["p90_km"]))
+    except Exception:
+        dist_mean_mean = dist_median_mean = dist_p90_mean = None
+    # --- End extra stats ---
+
     fig = plt.figure(figsize=(16, 12))
     gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.4)
 
@@ -510,9 +589,33 @@ def run_evaluation():
         + ", ".join([f"C{c}:{rmse_s3_cls[c]:.3f}" for c in range(1, CFG["STAGE1"]["num_classes"])])
     )
 
+    # Build enriched summary text for the figure footer
+    extra_lines = []
+    try:
+        extra_lines.append(
+            f"Front/None AUC/AP  S1: AUC={auc_s1_fig:.4f}, AP={ap_s1_fig:.4f} | "
+            f"S2: AUC={auc_s2_fig:.4f}, AP={ap_s2_fig:.4f}"
+        )
+    except Exception:
+        pass
+    if seasonal_month_mean is not None:
+        extra_lines.append(f"Seasonal crossing (monthly mean): {seasonal_month_mean:.4f}")
+    if isinstance(seasonal_means_by_season, dict) and len(seasonal_means_by_season) > 0:
+        parts = []
+        for s in ["DJF", "MAM", "JJA", "SON"]:
+            if s in seasonal_means_by_season:
+                parts.append(f"{s}:{seasonal_means_by_season[s]:.4f}")
+        if parts:
+            extra_lines.append("Seasonal crossing by season: " + ", ".join(parts))
+    if (dist_mean_mean is not None) and (dist_median_mean is not None) and (dist_p90_mean is not None):
+        extra_lines.append(
+            f"Distance stats mean (km): mean={dist_mean_mean:.2f}, median={dist_median_mean:.2f}, p90={dist_p90_mean:.2f}"
+        )
+
     summary_text = (
         f"Time-wise Presence-set match  (%): S1 {ratio_s1:.2f}, S2 {ratio_s2:.2f}, S3 {ratio_s3:.2f}\n"
         f"{ratio_text}\n{rmse_text}"
+        + ("\n" + "\n".join(extra_lines) if extra_lines else "")
     )
     fig.text(0.5, 0.005, summary_text, ha="center", va="bottom", fontsize=10)
 
@@ -561,6 +664,38 @@ def run_evaluation():
             f.write("Evaluation Metrics (Front Only: Classes 1-5)\n")
             f.write(df_metrics_filtered.round(4).to_string())
             f.write("\n\n")
+
+            # Additional Stats
+            try:
+                f.write("Additional Stats\n")
+                f.write(
+                    f"  Front/None AUC/AP: "
+                    f"S1 AUC={auc_s1_fig:.4f}, AP={ap_s1_fig:.4f}; "
+                    f"S2 AUC={auc_s2_fig:.4f}, AP={ap_s2_fig:.4f}\n"
+                )
+            except Exception:
+                pass
+            try:
+                if seasonal_month_mean is not None:
+                    f.write(f"  Seasonal crossing monthly mean: {seasonal_month_mean:.4f}\n")
+                if isinstance(seasonal_means_by_season, dict) and seasonal_means_by_season:
+                    parts = []
+                    for s in ["DJF", "MAM", "JJA", "SON"]:
+                        if s in seasonal_means_by_season:
+                            parts.append(f"{s}:{seasonal_means_by_season[s]:.4f}")
+                    if parts:
+                        f.write("  Seasonal crossing by season: " + ", ".join(parts) + "\n")
+            except Exception:
+                pass
+            try:
+                if (dist_mean_mean is not None) and (dist_median_mean is not None) and (dist_p90_mean is not None):
+                    f.write(
+                        f"  Distance stats mean (km): mean={dist_mean_mean:.2f}, "
+                        f"median={dist_median_mean:.2f}, p90={dist_p90_mean:.2f}\n"
+                    )
+            except Exception:
+                pass
+            f.write("\n")
 
             f.write("Loss History (from training)\n")
             try:

@@ -73,11 +73,12 @@ def create_comparison_videos(
             print(f"[動画作成] {month} の画像がありません。")
 
     if all_image_files:
+        year = CFG.get("EVAL", {}).get("year", 2023)
         all_image_files.sort(key=lambda x: os.path.basename(x))
         frame = cv2.imread(all_image_files[0])
         height, width, layers = frame.shape
 
-        output_video_all = os.path.join(output_folder, "comparison_2023_full_year.mp4")
+        output_video_all = os.path.join(output_folder, f"comparison_{year}_full_year.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         video = cv2.VideoWriter(output_video_all, fourcc, frame_rate, (width, height))
 
@@ -98,7 +99,7 @@ def create_comparison_videos(
             temp_image_path = os.path.join(temp_dir, f"frame_{idx:06d}.png")
             cv2.imwrite(temp_image_path, img_small)
 
-        output_video_low = os.path.join(output_folder, "comparison_2023_full_year_low.mp4")
+        output_video_low = os.path.join(output_folder, f"comparison_{year}_full_year_low.mp4")
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",

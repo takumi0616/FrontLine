@@ -18,7 +18,7 @@ class FrontalDatasetStage1(Dataset):
     """
     Stage1: GSM(93ch = 31vars*3times) -> 6-class segmentation target from front GT (5ch -> class map)
     """
-    def __init__(self, months, nc_gsm_dir, nc_0p5_dir, cache_size=50):
+    def __init__(self, months, nc_gsm_dir, nc_0p5_dir, cache_size=50, file_cache_size=10):
         self.months = months
         self.nc_gsm_dir = nc_gsm_dir
         self.nc_0p5_dir = nc_0p5_dir
@@ -28,7 +28,7 @@ class FrontalDatasetStage1(Dataset):
         self.cache = {}
         self.cache_size = cache_size
         self.file_cache = {}
-        self.file_cache_size = 10
+        self.file_cache_size = file_cache_size
         self.prepare_index()
 
     def prepare_index(self):

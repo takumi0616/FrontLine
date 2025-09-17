@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.resolve()))
 
-from main_v3_config import stage3_out_dir, stage4_svg_dir
+from main_v3_config import CFG, stage3_out_dir, stage4_svg_dir
 
 
 def smooth_polyline(points, window_size=3):
@@ -63,13 +63,8 @@ def save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3):
     前線別色の polyline を持つシンプルな SVG を出力する。
     viewBox = (min_lon, min_lat, width, height)
     """
-    class_colors = {
-        1: "#FF0000",   # 温暖前線（赤）
-        2: "#0000FF",   # 寒冷前線（青）
-        3: "#008015",   # 停滞前線（緑）
-        4: "#800080",   # 閉塞前線（紫）
-        5: "#FFA500",   # 前線の繋ぎ目（橙）
-    }
+    # 色指定は設定（VISUALIZATION.class_colors）から取得
+    class_colors = CFG["VISUALIZATION"]["class_colors"]
     svg_lines = []
     svg_lines.append('<?xml version="1.0" encoding="UTF-8"?>')
     min_lon, min_lat, width, height = viewBox
@@ -129,7 +124,12 @@ def evaluate_stage4(stage3_nc_dir, output_svg_dir):
         viewBox = (min_lon_val, min_lat_val, max_lon_val - min_lon_val, max_lat_val - min_lat_val)
 
         output_path = os.path.join(output_svg_dir, f"skeleton_{date_str}.svg")
-        save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3)
+        save_polylines_as_svg(
+            polylines,
+            viewBox,
+            output_path,
+            smoothing_window=CFG["STAGE4"]["smoothing_window"],  # 平滑化ウィンドウ（ポリラインの滑らかさ）
+        )
 
         del class_map, lat, lon, polylines
         gc.collect()

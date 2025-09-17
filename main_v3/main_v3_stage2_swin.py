@@ -211,6 +211,7 @@ def run_stage2():
         gap_size_range=aug["gap_size_range"],
         num_pix_to_change_range=aug["num_pix_to_change_range"],
         num_fake_front_range=aug["num_fake_front_range"],
+        cache_size=CFG["STAGE2"].get("dataset_cache_size", 50),
     )
     val_dataset_s2 = FrontalRefinementDataset(
         months=train_months,
@@ -227,6 +228,7 @@ def run_stage2():
         gap_size_range=aug["gap_size_range"],
         num_pix_to_change_range=aug["num_pix_to_change_range"],
         num_fake_front_range=aug["num_fake_front_range"],
+        cache_size=CFG["STAGE2"].get("dataset_cache_size", 50),
     )
     train_loader_s2 = DataLoader(
         train_dataset_s2,
@@ -258,6 +260,7 @@ def run_stage2():
         model_s2.parameters(),
         lr=CFG["STAGE2"]["optimizer"]["lr"],
         weight_decay=CFG["STAGE2"]["optimizer"]["weight_decay"],
+        betas=tuple(CFG["STAGE2"]["optimizer"].get("betas", (0.9, 0.99)))
     )
     model_init_end = time.time()
     print(f"[Stage2] モデル初期化時間: {format_time(model_init_end - model_init_start)}")
@@ -392,6 +395,7 @@ def run_stage2():
         nc_0p5_dir=nc_0p5_dir,
         mode="test",
         stage1_out_dir=stage1_out_dir,
+        cache_size=CFG["STAGE2"].get("dataset_cache_size", 50),
     )
     test_loader_s2 = DataLoader(
         test_dataset_s2,

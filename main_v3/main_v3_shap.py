@@ -206,8 +206,15 @@ def run_stage1_shap_evaluation_cpu(
       - CSV と図を保存
     """
     print("\n========== Stage-1 SHAP 解析 ==========")
-    months = get_available_months(2023, 1, 2023, 12)
-    ds = FrontalDatasetStage1(months, nc_gsm_dir, CFG["PATHS"]["nc_0p5_dir"])
+    y1, m1, y2, m2 = CFG["SHAP"].get("months", (2023, 1, 2023, 12))
+    months = get_available_months(y1, m1, y2, m2)
+    ds = FrontalDatasetStage1(
+        months,
+        nc_gsm_dir,
+        CFG["PATHS"]["nc_0p5_dir"],
+        cache_size=CFG["STAGE1"].get("dataset_cache_size", 50),
+        file_cache_size=CFG["STAGE1"].get("file_cache_size", 10),
+    )
     idxs = list(range(len(ds)))
     np.random.shuffle(idxs)
 
@@ -249,7 +256,7 @@ def run_stage1_shap_evaluation_cpu(
             if len(Xbuf[c]) >= max_samples_per_class:
                 continue
             xx = x.unsqueeze(0).to(dev)
-            sv = _safe_shap(expl[c], xx, ns=16)
+            sv = _safe_shap(expl[c], xx, ns=CFG["SHAP"].get("nsamples_default", 16))
             val = sv[0] if isinstance(sv, list) else sv
             if isinstance(val, torch.Tensor):
                 val = val.detach().cpu().numpy()
