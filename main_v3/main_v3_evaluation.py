@@ -475,8 +475,8 @@ def run_evaluation():
         dist_mean_mean = dist_median_mean = dist_p90_mean = None
     # --- End extra stats ---
 
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1, 1], hspace=0.4)
+    fig = plt.figure(figsize=(16, 15))
+    gs = fig.add_gridspec(3, 3, height_ratios=[3, 1.2, 1.3], hspace=0.5)
 
     def normalize_cm(cm):
         cm_norm = cm.astype("float") / (cm.sum(axis=1)[:, np.newaxis] + 1e-10)
@@ -617,10 +617,10 @@ def run_evaluation():
         f"{ratio_text}\n{rmse_text}"
         + ("\n" + "\n".join(extra_lines) if extra_lines else "")
     )
-    fig.text(0.5, 0.005, summary_text, ha="center", va="bottom", fontsize=10)
+    fig.text(0.5, 0.02, summary_text, ha="center", va="bottom", fontsize=10)
 
     out_fig = os.path.join(os.path.dirname(output_visual_dir), "evaluation_summary.png")
-    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.tight_layout(rect=[0, 0.14, 1, 1])
     plt.savefig(out_fig, dpi=300)
     plt.close()
 
