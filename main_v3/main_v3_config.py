@@ -34,7 +34,7 @@ CFG = {
     "STAGE1": {
         "num_classes": 6,  # クラス数（0=背景, 1..5=前線）
         "in_chans": 93,  # 入力チャネル数（GSM31変数×3時刻）
-        "epochs": 2,  # 学習エポック数
+        "epochs": 100,  # 学習エポック数
         "train_months": (2014, 1, 2022, 12),  # 学習データの年月範囲（開始年,開始月,終了年,終了月）
         "test_months":  (2023, 1, 2023, 12),  # テストデータの年月範囲
         "dataset_cache_size": 50,  # Datasetのサンプルキャッシュ上限（個）
@@ -73,7 +73,7 @@ CFG = {
     "STAGE2": {
         "num_classes": 6,  # クラス数（Stage2側の出力クラス）
         "in_chans": 1,  # 入力チャネル（Swin版のStage2で使用、拡散では6ch確率を扱う）
-        "epochs": 2,  # 学習エポック数
+        "epochs": 100,  # 学習エポック数
         "train_months": (2014, 1, 2022, 12),  # 学習データの年月範囲
         "dataset_cache_size": 50,  # FrontalRefinementDatasetのサンプルキャッシュ上限（個）
         "dataloader": {
