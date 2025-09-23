@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 import matplotlib.pyplot as plt
 
 from main_v3_config import (
@@ -16,6 +16,7 @@ from main_v3_config import (
 from main_v3_utils import get_available_months
 from main_v3_datasets import FrontalDatasetStage1
 from main_v3_models import SwinUnetModel, combined_loss
+from main_v3_ddp import is_dist_avail_and_initialized, get_local_rank, is_main_process
 
 
 def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
@@ -27,7 +28,7 @@ def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
     total = [0] * num_classes
     batch_count = 0
 
-    pbar = tqdm(dataloader, desc=f"[Stage1][Train Epoch {epoch+1}]")
+    pbar = tqdm(dataloader, desc=f"[Stage1][Train Epoch {epoch+1}]", disable=not is_main_process())
     for batch_idx, (inputs, targets, _) in enumerate(pbar):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
@@ -209,10 +210,13 @@ def run_stage1():
         cache_size=CFG["STAGE1"].get("dataset_cache_size", 50),           # サンプルキャッシュ上限（個）
         file_cache_size=CFG["STAGE1"].get("file_cache_size", 10),          # オープン済みNetCDFファイルのキャッシュ上限（個）
     )
+    sampler_train_s1 = DistributedSampler(train_dataset_s1, shuffle=True) if is_dist_avail_and_initialized() else None
+
     train_loader_s1 = DataLoader(
         train_dataset_s1,
         batch_size=CFG["STAGE1"]["dataloader"]["batch_size_train"],
-        shuffle=True,
+        shuffle=(sampler_train_s1 is None),
+        sampler=sampler_train_s1,
         num_workers=CFG["STAGE1"]["dataloader"]["num_workers"],
     )
     test_loader_s1 = DataLoader(
@@ -235,6 +239,10 @@ def run_stage1():
         in_chans=CFG["STAGE1"]["in_chans"],
         model_cfg=CFG["STAGE1"]["model"],
     ).to(device)
+    if is_dist_avail_and_initialized() and torch.cuda.is_available():
+        model_s1 = torch.nn.parallel.DistributedDataParallel(
+            model_s1, device_ids=[get_local_rank()], output_device=get_local_rank(), find_unused_parameters=False
+        )
     optimizer_s1 = optim.AdamW(
         model_s1.parameters(),
         lr=CFG["STAGE1"]["optimizer"]["lr"],
@@ -274,59 +282,67 @@ def run_stage1():
     best_epoch = -1
     training_start = time.time()
     for epoch in range(start_epoch, num_epochs_stage1):
+        if 'sampler_train_s1' in locals() and sampler_train_s1 is not None:
+            sampler_train_s1.set_epoch(epoch)
         epoch_start = time.time()
         train_loss = train_stage1_one_epoch(
             model_s1, train_loader_s1, optimizer_s1, epoch, CFG["STAGE1"]["num_classes"]
         )
-        test_loss = test_stage1_one_epoch(model_s1, test_loader_s1, epoch, CFG["STAGE1"]["num_classes"])
+        test_loss = test_stage1_one_epoch(model_s1, test_loader_s1, epoch, CFG["STAGE1"]["num_classes"]) if is_main_process() else 0.0
         train_losses.append(train_loss)
         test_losses.append(test_loss)
-        if test_loss < best_test_loss:
+        if is_main_process() and test_loss < best_test_loss:
             best_test_loss = test_loss
-            best_model_state = model_s1.state_dict()
+            best_model_state = model_s1.module.state_dict() if hasattr(model_s1, "module") else model_s1.state_dict()
             best_epoch = epoch
             print(f"[Stage1] 新しい最良モデルを見つけました（エポック {epoch+1}）: テスト損失 = {test_loss:.4f}")
 
         epoch_end = time.time()
-        print(f"[Stage1] エポック {epoch+1} 実行時間: {format_time(epoch_end - epoch_start)}")
+        if is_main_process():
+            print(f"[Stage1] エポック {epoch+1} 実行時間: {format_time(epoch_end - epoch_start)}")
 
         # Save checkpoint
-        save_start = time.time()
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model_s1.state_dict(),
-            "optimizer_state_dict": optimizer_s1.state_dict(),
-            "train_loss": train_loss,
-            "test_loss": test_loss,
-        }
-        checkpoint_path = os.path.join(model_s1_save_dir, f"checkpoint_epoch_{epoch}.pth")
-        torch.save(checkpoint, checkpoint_path)
-        print(f"[Stage1] チェックポイントを保存しました: checkpoint_epoch_{epoch}.pth")
-        if epoch > 0:
-            previous_checkpoint_path = os.path.join(model_s1_save_dir, f"checkpoint_epoch_{epoch - 1}.pth")
-            if os.path.exists(previous_checkpoint_path):
-                try:
-                    os.remove(previous_checkpoint_path)
-                    print(f"[Stage1] 前回のチェックポイントを削除しました: checkpoint_epoch_{epoch - 1}.pth")
-                except Exception as e:
-                    print(f"[Stage1] 旧チェックポイント削除失敗: {e}")
-        save_end = time.time()
-        print(f"[Stage1] チェックポイント保存時間: {format_time(save_end - save_start)}")
+        if is_main_process():
+            save_start = time.time()
+            state_dict_to_save = model_s1.module.state_dict() if hasattr(model_s1, "module") else model_s1.state_dict()
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": state_dict_to_save,
+                "optimizer_state_dict": optimizer_s1.state_dict(),
+                "train_loss": train_loss,
+                "test_loss": test_loss,
+            }
+            checkpoint_path = os.path.join(model_s1_save_dir, f"checkpoint_epoch_{epoch}.pth")
+            torch.save(checkpoint, checkpoint_path)
+            print(f"[Stage1] チェックポイントを保存しました: checkpoint_epoch_{epoch}.pth")
+            if epoch > 0:
+                previous_checkpoint_path = os.path.join(model_s1_save_dir, f"checkpoint_epoch_{epoch - 1}.pth")
+                if os.path.exists(previous_checkpoint_path):
+                    try:
+                        os.remove(previous_checkpoint_path)
+                        print(f"[Stage1] 前回のチェックポイントを削除しました: checkpoint_epoch_{epoch - 1}.pth")
+                    except Exception as e:
+                        print(f"[Stage1] 旧チェックポイント削除失敗: {e}")
+            save_end = time.time()
+            print(f"[Stage1] チェックポイント保存時間: {format_time(save_end - save_start)}")
 
     training_end = time.time()
-    print(f"[Stage1] 学習ループ全体の実行時間: {format_time(training_end - training_start)}")
+    if is_main_process():
+        print(f"[Stage1] 学習ループ全体の実行時間: {format_time(training_end - training_start)}")
 
     # Save final/best model
-    final_save_start = time.time()
-    if best_model_state is not None:
-        torch.save(best_model_state, os.path.join(model_s1_save_dir, "model_final.pth"))
-        print(f"[Stage1] 最良モデル（エポック {best_epoch+1}）を model_final.pth として保存しました")
-    else:
-        torch.save(model_s1.state_dict(), os.path.join(model_s1_save_dir, "model_final.pth"))
-        print(f"[Stage1] 最終的なモデルを保存しました: model_final.pth")
+    if is_main_process():
+        final_save_start = time.time()
+        if best_model_state is not None:
+            torch.save(best_model_state, os.path.join(model_s1_save_dir, "model_final.pth"))
+            print(f"[Stage1] 最良モデル（エポック {best_epoch+1}）を model_final.pth として保存しました")
+        else:
+            torch.save((model_s1.module.state_dict() if hasattr(model_s1, "module") else model_s1.state_dict()),
+                       os.path.join(model_s1_save_dir, "model_final.pth"))
+            print(f"[Stage1] 最終的なモデルを保存しました: model_final.pth")
 
     # Plot and save loss curves + CSV
-    if len(train_losses) > 0:
+    if is_main_process() and len(train_losses) > 0:
         plt.figure(figsize=(10, 6))
         epochs = list(range(start_epoch + 1, start_epoch + len(train_losses) + 1))
         plt.plot(epochs, train_losses, "b-", label="Train Loss")
@@ -363,18 +379,19 @@ def run_stage1():
         except Exception as e:
             print(f"[Stage1] Loss history CSV copy skipped: {e}")
 
-    final_save_end = time.time()
-    print(f"[Stage1] 最終モデル保存時間: {format_time(final_save_end - final_save_start)}")
+    if is_main_process():
+        final_save_end = time.time()
+        print(f"[Stage1] 最終モデル保存時間: {format_time(final_save_end - final_save_start)}")
 
-    # Evaluate and export nc
-    eval_start = time.time()
-    if best_model_state is not None:
-        model_s1.load_state_dict(best_model_state)
-        print(f"[Stage1] 評価のために最良モデル（エポック {best_epoch+1}）をロードしました")
+        # Evaluate and export nc (rank0のみで全データを処理)
+        eval_start = time.time()
+        if best_model_state is not None:
+            model_s1.load_state_dict(best_model_state)
+            print(f"[Stage1] 評価のために最良モデル（エポック {best_epoch+1}）をロードしました")
 
-    evaluate_stage1(model_s1, test_loader_s1, save_nc_dir=stage1_out_dir)
-    eval_end = time.time()
-    print(f"[Stage1] 評価時間: {format_time(eval_end - eval_start)}")
+        evaluate_stage1(model_s1, test_loader_s1, save_nc_dir=stage1_out_dir)
+        eval_end = time.time()
+        print(f"[Stage1] 評価時間: {format_time(eval_end - eval_start)}")
 
     # Cleanup
     cleanup_start = time.time()

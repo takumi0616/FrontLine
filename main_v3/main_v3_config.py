@@ -7,6 +7,13 @@ import numpy as np
 from pathlib import Path
 import torch.nn as nn
 
+# Helper to decide main process for logging in DDP
+def _is_main_proc():
+    try:
+        return int(os.environ.get("RANK", "0")) == 0
+    except Exception:
+        return True
+
 # Ensure local imports (e.g. swin_unet) work when running from repo root
 sys.path.append(str(Path(__file__).parent.resolve()))
 
@@ -190,7 +197,18 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True  # CuDNNを決定論モードに
     torch.backends.cudnn.benchmark = False  # ベンチマーク無効（再現性優先）
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 使用デバイス
+# Device selection (DDP-aware: prefer LOCAL_RANK if present)
+if torch.cuda.is_available():
+    if "LOCAL_RANK" in os.environ:
+        try:
+            _lr = int(os.environ.get("LOCAL_RANK", "0"))
+        except Exception:
+            _lr = 0
+        device = torch.device(f"cuda:{_lr}")
+    else:
+        device = torch.device("cuda")
+else:
+    device = torch.device("cpu")  # 使用デバイス
 
 # Derived constants and common paths
 ORIG_H = CFG["IMAGE"]["ORIG_H"]  # 画像高さ（ショートカット）
@@ -228,16 +246,18 @@ def format_time(seconds: float) -> str:
         return f"{seconds:.2f}秒"  # s の文字列
 
 # Informative prints (kept for behavioral parity with original script)
-if torch.cuda.is_available():
-    try:
-        print("GPU is available!")
-        print(f"Device Name: {torch.cuda.get_device_name(0)}")
-    except Exception:
-        print("GPU is available!")
-else:
-    print("GPU is not available.")
-print(f"Random seed set as {seed}")
-print("Using device:", device)
+if _is_main_proc():
+    if torch.cuda.is_available():
+        try:
+            _dev_idx = int(os.environ.get("LOCAL_RANK", "0"))
+            print("GPU is available!")
+            print(f"Device Name: {torch.cuda.get_device_name(_dev_idx)}")
+        except Exception:
+            print("GPU is available!")
+    else:
+        print("GPU is not available.")
+    print(f"Random seed set as {seed}")
+    print("Using device:", device)
 
 __all__ = [
     "CFG", "device", "ORIG_H", "ORIG_W",
