@@ -7,7 +7,7 @@ import importlib.util as _ilu
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -17,7 +17,6 @@ from main_v3_config import (
     nc_0p5_dir, stage1_out_dir, stage2_out_dir, model_s2_save_dir
 )
 from main_v3_datasets import FrontalRefinementDataset, Stage2DiffusionTestDataset
-from main_v3_ddp import is_dist_avail_and_initialized, get_local_rank, is_main_process
 
 
 def _load_diffusion_corrector():
@@ -141,14 +140,10 @@ def run_stage2_diffusion():
         num_fake_front_range=aug["num_fake_front_range"],
         cache_size=CFG["STAGE2"].get("dataset_cache_size", 50),
     )
-    sampler_train = DistributedSampler(train_ds, shuffle=True) if is_dist_avail_and_initialized() else None
-    sampler_val = DistributedSampler(val_ds, shuffle=False) if is_dist_avail_and_initialized() else None
-
     train_ld = DataLoader(
         train_ds,
         batch_size=CFG["STAGE2"]["dataloader"]["batch_size_train"],
-        shuffle=(sampler_train is None),
-        sampler=sampler_train,
+        shuffle=True,
         num_workers=CFG["STAGE2"]["dataloader"]["num_workers"],
         pin_memory=torch.cuda.is_available(),
         persistent_workers=CFG["STAGE2"]["dataloader"]["num_workers"] > 0
@@ -157,7 +152,6 @@ def run_stage2_diffusion():
         val_ds,
         batch_size=CFG["STAGE2"]["dataloader"]["batch_size_val"],
         shuffle=False,
-        sampler=sampler_val,
         num_workers=CFG["STAGE2"]["dataloader"]["num_workers"],
         pin_memory=torch.cuda.is_available(),
         persistent_workers=CFG["STAGE2"]["dataloader"]["num_workers"] > 0
@@ -184,10 +178,6 @@ def run_stage2_diffusion():
         device=device
     )
     model.to(device)
-    if is_dist_avail_and_initialized() and torch.cuda.is_available():
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[get_local_rank()], output_device=get_local_rank(), find_unused_parameters=False
-        )
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=CFG["STAGE2"]["optimizer"]["lr"],
@@ -207,17 +197,12 @@ def run_stage2_diffusion():
     best_loss = float("inf")
     best_state = None
     train_losses, val_losses = [], []
-    if is_main_process():
-        print("[Stage2-Diff][Paired] Training start")
+    print("[Stage2-Diff][Paired] Training start")
     for epoch in range(CFG["STAGE2"]["epochs"]):
-        if 'sampler_train' in locals() and sampler_train is not None:
-            sampler_train.set_epoch(epoch)
-        if 'sampler_val' in locals() and sampler_val is not None:
-            sampler_val.set_epoch(epoch)
         # Train
         model.train()
         ep_loss, nb = 0.0, 0
-        pbar = tqdm(train_ld, desc=f"[Stage2-Diff][Epoch {epoch+1}]", disable=not is_main_process())
+        pbar = tqdm(train_ld, desc=f"[Stage2-Diff][Epoch {epoch+1}]")
         for x_in, y_gt, _ in pbar:
             # x_in: (B,1,H,W) float with labels-like values 0..5
             # y_gt: (B,H,W) long  0..5
@@ -261,12 +246,10 @@ def run_stage2_diffusion():
 
         # checkpoint + best
         ckpt_path = os.path.join(model_s2_save_dir, f"diff_checkpoint_epoch_{epoch}.pth")
-        if is_main_process():
-            try:
-                state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-                torch.save(state_to_save, ckpt_path)
-            except Exception as e:
-                print(f"[Stage2-Diff] checkpoint save failed: {e}")
+        try:
+            torch.save(model.state_dict(), ckpt_path)
+        except Exception as e:
+            print(f"[Stage2-Diff] checkpoint save failed: {e}")
         if avg_val < best_loss:
             best_loss = avg_val
             try:
@@ -274,7 +257,7 @@ def run_stage2_diffusion():
             except Exception:
                 best_state = model.state_dict()
 
-        if is_main_process() and epoch > 0:
+        if epoch > 0:
             prev = os.path.join(model_s2_save_dir, f"diff_checkpoint_epoch_{epoch-1}.pth")
             if os.path.exists(prev):
                 try:
@@ -284,30 +267,28 @@ def run_stage2_diffusion():
 
     # Save final/best model and loss curves
     final_path = os.path.join(model_s2_save_dir, "model_final.pth")
-    if is_main_process():
-        try:
-            if best_state is not None:
-                torch.save(best_state, final_path)
-            else:
-                state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-                torch.save(state_to_save, final_path)
-        except Exception as e:
-            print(f"[Stage2-Diff] save final failed: {e}")
+    try:
+        if best_state is not None:
+            torch.save(best_state, final_path)
+            model.load_state_dict(best_state)
+        else:
+            torch.save(model.state_dict(), final_path)
+    except Exception as e:
+        print(f"[Stage2-Diff] save final failed: {e}")
 
-    if is_main_process():
-        try:
-            plt.figure(figsize=(8, 4))
-            epochs_axis = list(range(1, len(train_losses) + 1))
-            plt.plot(epochs_axis, train_losses, label="train_loss")
-            plt.plot(epochs_axis, val_losses, label="val_loss")
-            best_epoch = int(np.argmin(val_losses)) + 1 if len(val_losses) > 0 else 1
-            plt.axvline(x=best_epoch, color="g", linestyle="--", label=f"Best ({best_epoch})")
-            plt.xlabel("epoch"); plt.ylabel("loss"); plt.grid(True); plt.legend(); plt.tight_layout()
-            plt.savefig(os.path.join(model_s2_save_dir, "loss_curve.png"), dpi=150); plt.close()
-            pd.DataFrame({"epoch": epochs_axis, "train_loss": train_losses, "val_loss": val_losses}) \
-                .to_csv(os.path.join(model_s2_save_dir, "loss_history.csv"), index=False)
-        except Exception as e:
-            print(f"[Stage2-Diff] save loss curve failed: {e}")
+    try:
+        plt.figure(figsize=(8, 4))
+        epochs_axis = list(range(1, len(train_losses) + 1))
+        plt.plot(epochs_axis, train_losses, label="train_loss")
+        plt.plot(epochs_axis, val_losses, label="val_loss")
+        best_epoch = int(np.argmin(val_losses)) + 1 if len(val_losses) > 0 else 1
+        plt.axvline(x=best_epoch, color="g", linestyle="--", label=f"Best ({best_epoch})")
+        plt.xlabel("epoch"); plt.ylabel("loss"); plt.grid(True); plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(model_s2_save_dir, "loss_curve.png"), dpi=150); plt.close()
+        pd.DataFrame({"epoch": epochs_axis, "train_loss": train_losses, "val_loss": val_losses}) \
+            .to_csv(os.path.join(model_s2_save_dir, "loss_history.csv"), index=False)
+    except Exception as e:
+        print(f"[Stage2-Diff] save loss curve failed: {e}")
 
     # -----------------------------
     # Inference (refinement) conditioned on Stage1 probabilities
@@ -321,8 +302,6 @@ def run_stage2_diffusion():
         pin_memory=torch.cuda.is_available()
     )
     os.makedirs(stage2_out_dir, exist_ok=True)
-    if not is_main_process():
-        return
     print(f"[Stage2-Diff][Paired] Inference on {len(test_ds)} files")
 
     steps = cfgd["steps"]
@@ -338,8 +317,7 @@ def run_stage2_diffusion():
             # probs: (B,6,H,W)  -> use as condition
             probs = probs.to(device)
             t_start = int(t_start_frac * (model.num_timesteps - 1))
-            mod = model.module if hasattr(model, "module") else model
-            rec = mod.correct_from_probs_cond(probs, steps=steps, t_start=t_start, ensemble=ensemble)  # (E*B,6,H,W)
+            rec = model.correct_from_probs_cond(probs, steps=steps, t_start=t_start, ensemble=ensemble)  # (E*B,6,H,W)
 
             # ensemble average
             rec = rec.view(ensemble, -1, rec.shape[1], rec.shape[2], rec.shape[3]).mean(dim=0)  # (B,6,H,W)
