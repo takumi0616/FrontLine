@@ -120,7 +120,7 @@ CFG = {
             "num_fake_front_range": (2, 10)  # 偽前線を追加する回数の範囲
         },
         "diffusion": {
-            "base_dim": 64,  # 拡散モデルのUNet基底チャネル幅
+            "base_dim": 128,  # 拡散モデルのUNet基底チャネル幅
             "dim_mults": [1, 2, 2, 2],  # UNetの段階ごとの幅倍率
             "dropout": 0.0,  # UNet内部のドロップアウト率
             "objective": "pred_v",  # 学習目標（v-parameterization）
