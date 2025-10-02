@@ -40,7 +40,7 @@ CFG = {
         "dataset_cache_size": 50,  # Datasetのサンプルキャッシュ上限（個）
         "file_cache_size": 10,  # Datasetでオープン保持するNetCDFファイルの上限（個）
         "dataloader": {
-            "batch_size_train": 32,  # 学習時のバッチサイズ
+            "batch_size_train": 16,  # 学習時のバッチサイズ
             "batch_size_test": 1,  # テスト時のバッチサイズ
             "num_workers": 4  # DataLoaderのワーカ数
         },
@@ -77,7 +77,7 @@ CFG = {
         "train_months": (2014, 1, 2022, 12),  # 学習データの年月範囲
         "dataset_cache_size": 50,  # FrontalRefinementDatasetのサンプルキャッシュ上限（個）
         "dataloader": {
-            "batch_size_train": 32,  # 学習時のバッチサイズ
+            "batch_size_train": 16,  # 学習時のバッチサイズ
             "batch_size_val": 1,  # 検証時のバッチサイズ
             "batch_size_test": 1,  # 推論時のバッチサイズ
             "num_workers": 4  # DataLoaderのワーカ数
