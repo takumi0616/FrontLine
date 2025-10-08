@@ -1,3 +1,32 @@
+"""
+概要:
+    v3 パイプライン（学習→SHAP→拡散補正→スケルトン化→可視化→評価→動画→SVG）の
+    各ステージをモジュール化した実装を順番に呼び出す「オーケストレータ」スクリプト。
+    本ファイルは実装の詳細を持たず、各ステージのランナー関数を呼ぶことで全処理を実行する。
+
+構成:
+    - main_v3.main_v3_config:
+        設定辞書 CFG とユーティリティ（print_memory_usage, format_time）を提供
+    - main_v3.main_v3_stage1:
+        Stage1（Swin-UNet）学習・評価のランナー run_stage1()
+    - main_v3.main_v3_shap:
+        Stage1 モデルの SHAP 解析 run_stage1_shap_evaluation_cpu()
+    - main_v3.main_v3_stage2_diffusion:
+        Stage2（DiffusionCorrector による確率補正）の学習・推論ランナー run_stage2_diffusion()
+    - main_v3.main_v3_stage3:
+        Stage3（スケルトン化）ランナー run_stage3()
+    - main_v3.main_v3_visualize:
+        可視化ランナー run_visualization() および比較動画作成 create_comparison_videos()
+    - main_v3.main_v3_evaluation:
+        総合評価ランナー run_evaluation()
+    - main_v3.main_v3_stage4_svg:
+        Stage4（SVG 出力）ランナー run_stage4()
+
+使い方:
+    python main_v3.py を実行すると、main() が各ステージを順次実行し、
+    成果物（モデル、NetCDF、PNG、SVG、ログ、動画）を v3 の出力ディレクトリ配下に保存する。
+"""
+
 import time
 
 # Thin orchestrator that wires modularized v3 pipeline
@@ -13,6 +42,27 @@ from main_v3.main_v3_stage4_svg import run_stage4
 
 
 def main():
+    """
+    概要:
+        v3 パイプライン全体（Stage1→SHAP→Stage2(拡散)→Stage3→可視化→評価→動画→Stage4）を順次実行する
+        エントリポイント。各ステージの実行時間を計測し、メモリ使用量も適宜出力する。
+
+    入力:
+        なし（設定は main_v3_config.CFG を参照）
+
+    処理:
+        1) Stage1 学習・評価（Swin-UNet）
+        2) Stage1 モデルの SHAP 解析
+        3) Stage2 拡散モデル（DiffusionCorrector）による確率補正（学習・推論）
+        4) Stage3 スケルトン化
+        5) Stage1/2/3 の結果を地図上に可視化（PNG出力）
+        6) 2023年共通時刻で総合評価（混同行列、指標の図表・ログ）
+        7) 比較画像から動画作成（通常/低解像度）
+        8) Stage4 SVG 出力（骨格ポリライン）
+
+    出力:
+        なし（副作用として各ステージの成果物を v3 の出力ディレクトリ配下に保存）
+    """
     total_start_time = time.time()
     print_memory_usage("Start main")
 

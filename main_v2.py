@@ -224,6 +224,26 @@ def create_comparison_videos(image_folder="./v2_result/visualizations/",
                              frame_rate=4,
                              low_res_scale=4,  
                              low_res_frame_rate=2):  
+    """
+    概要:
+        可視化で生成された比較画像（comparison_*.png）から、月別および通年の動画(mp4)を作成する。
+
+    入力:
+        - image_folder (str): 入力画像ディレクトリ（comparison_*.png が格納されていること）
+        - output_folder (str): 出力動画の保存ディレクトリ
+        - frame_rate (int|float): 通常解像度の動画のフレームレート
+        - low_res_scale (int): 低解像度動画の縮小係数（width/height を 1/low_res_scale に縮小）
+        - low_res_frame_rate (int|float): 低解像度動画のフレームレート
+
+    処理:
+        - ファイル名から年月(YYYYMM)を抽出してグルーピング
+        - 月別に OpenCV の VideoWriter で mp4 を生成
+        - 通年の結合動画を作成
+        - さらに ffmpeg を用いて低解像度版（libx264 yuv420p）を生成
+
+    出力:
+        - output_folder に mp4 を保存（例: comparison_202301.mp4, comparison_2023_full_year.mp4, comparison_2023_full_year_low.mp4）
+    """
 
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -308,6 +328,19 @@ def create_comparison_videos(image_folder="./v2_result/visualizations/",
         print("[動画作成] 年間動画用の画像ファイルが見つかりませんでした。")
 
 def print_memory_usage(msg=""):
+    """
+    概要:
+        現在プロセスのRSS(実使用メモリ)をMB単位で出力する簡易ユーティリティ。
+
+    入力:
+        - msg (str): 付加メッセージ（どのタイミングかを示すラベル）
+
+    処理:
+        - psutil で自プロセスの RSS を取得し、MB単位に換算して print
+
+    出力:
+        - なし（標準出力へログ出力）
+    """
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info().rss / 1024 / 1024 
     print(f"[Memory] {msg} memory usage: {mem_info:.2f} MB")
@@ -337,6 +370,20 @@ ORIG_H = CFG["IMAGE"]["ORIG_H"]
 ORIG_W = CFG["IMAGE"]["ORIG_W"]
 
 def get_available_months(start_year, start_month, end_year, end_month):
+    """
+    概要:
+        開始年月から終了年月までを含む YYYYMM の文字列リストを生成する。
+
+    入力:
+        - start_year (int), start_month (int): 開始年・月
+        - end_year (int), end_month (int): 終了年・月（含む）
+
+    処理:
+        - datetime を用いて1ヶ月ずつ進めながら YYYYMM 形式の文字列にして蓄積
+
+    出力:
+        - months (List[str]): 例 ["201401", ..., "202212"]
+    """
     months = []
     current = datetime(start_year, start_month, 1)
     end = datetime(end_year, end_month, 1)
@@ -349,6 +396,26 @@ def get_available_months(start_year, start_month, end_year, end_month):
     return months
 
 class FrontalDatasetStage1(Dataset):
+    """
+    概要:
+        Stage1（Swin-UNet）学習/評価用データセット。
+        GSM の多変量データ（t-6h, t0, t+6h を結合）を入力テンソル(93ch)として返し、
+        0/1の前線ラスタ（5クラス）をクラスID(0..5)の2次元マップに変換して教師として返す。
+
+    入力:
+        - months (List[str]): 対象年月のリスト（YYYYMM）
+        - nc_gsm_dir (str): GSM NetCDF のディレクトリ
+        - nc_0p5_dir (str): 前線ラスタ NetCDF のディレクトリ
+        - cache_size (int): サンプルキャッシュの最大保持数
+
+    処理:
+        - prepare_index() で各月のファイル存在/時刻整合を確認し、データインデックスを構築
+        - __getitem__ でインデックスから入力(93ch)と教師(クラスID HxW)を生成
+        - メモリ節約のため、最近アクセス分をキャッシュして再利用
+
+    出力:
+        - __getitem__ -> (gsm_tensor: FloatTensor[93,H,W], target_cls: LongTensor[H,W], time_str: str)
+    """
     def __init__(self, months, nc_gsm_dir, nc_0p5_dir, cache_size=50):
         self.months = months
         self.nc_gsm_dir = nc_gsm_dir
@@ -363,6 +430,20 @@ class FrontalDatasetStage1(Dataset):
         self.prepare_index()
 
     def prepare_index(self):
+        """
+        概要:
+            GSM/前線NetCDFを走査し、共通時刻かつ t±6h が存在するサンプルのみを data_index に登録する。
+
+        入力:
+            なし（コンストラクタで与えられたパス/設定を使用）
+
+        処理:
+            - 月ごとに gsm{YYYYMM}.nc と {YYYYMM}.nc を開き、共通 time を抽出
+            - 各 time について t-6h, t+6h の両方があるときのみ採用し、必要メタ情報を data_index に保存
+
+        出力:
+            なし（内部状態 data_index, lat, lon を更新）
+        """
         print_memory_usage("Before Stage1 prepare_index")
         for month in self.months:
             gsm_file = os.path.join(self.nc_gsm_dir, f"gsm{month}.nc")
@@ -413,6 +494,23 @@ class FrontalDatasetStage1(Dataset):
         gc.collect()
 
     def load_single_item(self, idx):
+        """
+        概要:
+            data_index[idx] で指定される1サンプルをディスクから読み出し、学習用の入力/教師を組み立てる。
+
+        入力:
+            - idx (int): サンプルのインデックス
+
+        処理:
+            - ファイルキャッシュ（self.file_cache）を用いて NetCDF を再利用
+            - GSM(t-6h, t0, t+6h) を連結し 93ch の入力配列を作成
+            - 前線ラスタ(5ch)をクラスID(1..5)へマッピングし、背景を0として target_cls を作成
+
+        出力:
+            - gsm_data (np.ndarray[float32]): (93,H,W)
+            - front_data (np.ndarray[float32]): (5,H,W) 元の one-hot ラスタ（返却は内部のみ）
+            - t_now (pd.Timestamp): サンプルの時刻
+        """
         item = self.data_index[idx]
         gsm_file = item['gsm_file']
         front_file = item['front_file']
@@ -453,9 +551,39 @@ class FrontalDatasetStage1(Dataset):
         return gsm_data.astype(np.float32), front_data.astype(np.float32), t_now
 
     def __len__(self):
+        """
+        概要:
+            登録済みサンプル数を返す。
+
+        入力:
+            なし
+
+        処理:
+            - data_index の長さを返却
+
+        出力:
+            - n (int)
+        """
         return len(self.data_index)
 
     def __getitem__(self, idx):
+        """
+        概要:
+            PyTorch DataLoader から呼ばれ、idx 番目のテンソル/教師/時刻文字列を返す。
+
+        入力:
+            - idx (int): サンプル番号
+
+        処理:
+            - サンプルキャッシュ（self.cache）を優先的に利用
+            - load_single_item で取得した (gsm, front, t) から
+              gsm を Tensor[93,H,W] へ、front をクラスID Tensor[H,W] へ変換
+
+        出力:
+            - gsm_tensor (torch.FloatTensor): (93,H,W)
+            - target_cls (torch.LongTensor): (H,W), 値は 0..5
+            - time_str (str): ISO 形式の時刻文字列
+        """
         if idx in self.cache:
             gsm_data, front_data, time_dt = self.cache[idx]
         else:
@@ -477,6 +605,21 @@ class FrontalDatasetStage1(Dataset):
         return gsm_tensor, target_cls, time_str
 
 class SwinUnetModel(nn.Module):
+    """
+    概要:
+        Swin-UNet 本体の薄いラッパ。CFG 由来のハイパーパラメータで SwinTransformerSys を構築する。
+
+    入力:
+        - num_classes (int): 出力クラス数（例 6）
+        - in_chans (int): 入力チャネル数（例 93）
+        - model_cfg (dict|None): 明示指定があればそれを使用、None の場合は CFG["STAGE1"]["model"]
+
+    処理:
+        - SwinTransformerSys を初期化して self.swin_unet に保持
+
+    出力:
+        - forward(x): ロジット (B,C,H,W)
+    """
     def __init__(self, num_classes=6, in_chans=93, model_cfg=None):
         super(SwinUnetModel, self).__init__()
         cfg = model_cfg if model_cfg is not None else CFG["STAGE1"]["model"]
@@ -504,10 +647,41 @@ class SwinUnetModel(nn.Module):
         )
 
     def forward(self, x):
+        """
+        概要:
+            入力テンソルからクラスごとのロジットを推論する。
+
+        入力:
+            - x (Tensor): (B, in_chans, H, W)
+
+        処理:
+            - SwinTransformerSys にそのまま渡してロジットを得る
+
+        出力:
+            - logits (Tensor): (B, num_classes, H, W)
+        """
         logits = self.swin_unet(x)
         return logits
 
 class DiceLoss(nn.Module):
+    """
+    概要:
+        マルチクラス Dice 損失（クラスごとに Dice を計算し平均）を返す。
+
+    入力:
+        - classes (int): クラス数
+        - forward(inputs, targets)
+            - inputs: (B, C, H, W) ロジット（内部で softmax）
+            - targets: (B, H, W) クラスID
+
+    処理:
+        - softmax で確率化
+        - 各クラスについて flatten して Dice を計算
+        - クラス平均を返す
+
+    出力:
+        - loss (Tensor): スカラー
+    """
     def __init__(self, classes):
         super(DiceLoss, self).__init__()
         self.classes = classes
@@ -530,11 +704,43 @@ ce_loss = nn.CrossEntropyLoss()
 dice_loss = DiceLoss(classes=num_classes_stage1)
 
 def combined_loss(inputs, targets):
+    """
+    概要:
+        クロスエントロピー + Dice の合算損失。
+
+    入力:
+        - inputs (Tensor): (B, C, H, W) ロジット
+        - targets (Tensor): (B, H, W) クラスID
+
+    処理:
+        - CE と Dice を計算し加算
+
+    出力:
+        - loss (Tensor): スカラー
+    """
     loss_ce = ce_loss(inputs, targets)
     loss_dc = dice_loss(inputs, targets)
     return loss_ce + loss_dc
 
 def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
+    """
+    概要:
+        Stage1 モデルの1エポック学習を行い、平均損失と各クラス精度をログ出力する。
+
+    入力:
+        - model (nn.Module): 学習対象モデル
+        - dataloader (DataLoader): 学習データローダ
+        - optimizer (Optimizer): 最適化手法
+        - epoch (int): 現在のエポック番号（0始まり）
+        - num_classes (int): クラス数
+
+    処理:
+        - バッチ毎に forward/backward/step
+        - ロス/精度を集計
+
+    出力:
+        - avg_epoch_loss (float): エポック平均損失
+    """
     print_memory_usage(f"Before Stage1 train epoch={epoch+1}")
     model.train()
     running_loss = 0.0
@@ -580,6 +786,19 @@ def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
     return avg_epoch_loss
 
 def test_stage1_one_epoch(model, dataloader, epoch, num_classes):
+    """
+    概要:
+        Stage1 の検証（勾配停止）を1エポック分実施し、平均損失と各クラス精度を出力。
+
+    入力:
+        - model, dataloader, epoch, num_classes: train_stage1_one_epoch と同様
+
+    処理:
+        - no_grad で推論しロス/精度を集計
+
+    出力:
+        - avg_loss (float): 平均損失
+    """
     print_memory_usage(f"Before Stage1 test epoch={epoch+1}")
     model.eval()
     test_loss = 0.0
@@ -613,6 +832,23 @@ def test_stage1_one_epoch(model, dataloader, epoch, num_classes):
     return avg_loss
 
 def evaluate_stage1(model, dataloader, save_nc_dir=None):
+    """
+    概要:
+        Stage1 モデルの推論を実行し、メトリクス計算と NetCDF 保存（任意）を行う。
+
+    入力:
+        - model (nn.Module)
+        - dataloader (DataLoader)
+        - save_nc_dir (str|None): 出力先ディレクトリ。None の場合は保存しない。
+
+    処理:
+        - 全サンプルで softmax により確率と予測クラスを集計
+        - precision/recall/f1/accuracy を算出
+        - save_nc_dir 指定時は (lat, lon, class) の DataArray を NetCDF 出力
+
+    出力:
+        - なし（ログ/ファイル出力）
+    """
     print_memory_usage("Before evaluate_stage1")
     evaluate_start = time.time()
     
@@ -688,6 +924,23 @@ def evaluate_stage1(model, dataloader, save_nc_dir=None):
     print_memory_usage("After evaluate_stage1")
 
 def run_stage1():
+    """
+    概要:
+        Stage1（Swin-UNet, 93入力→6クラス）の学習・検証・推論・保存を一括実行する。
+
+    入力:
+        なし（CFG から設定を参照）
+
+    処理:
+        - データセット/データローダ構築
+        - モデル/オプティマイザ初期化
+        - チェックポイント再開（あれば）
+        - 学習ループ（各エポックでtrain/test・チェックポイント保存）
+        - 最良モデル保存、Loss曲線/CSV出力、評価推論の NetCDF 保存
+
+    出力:
+        - なし（成果物は v2_result 下に保存）
+    """
     print_memory_usage("Start Stage 1")
     stage1_start = time.time()
     ds_start = time.time()
@@ -847,6 +1100,27 @@ def run_stage1():
     print_memory_usage("After Stage 1")
 
 class FrontalRefinementDataset(Dataset):
+    """
+    概要:
+        Stage2（補正学習）用データセット。
+        - train/val: GT から擬似的な劣化をかけたクラスマップを入力、GT を教師として返す
+        - test: Stage1 の確率から得た最頻クラスを入力、教師はダミー（0）を返す
+
+    入力:
+        - months (List[str]|None): train/val 対象の年月リスト（test では None）
+        - nc_0p5_dir (str): GT 前線 NetCDF のディレクトリ
+        - mode (str): 'train'|'val'|'test'
+        - stage1_out_dir (str|None): test モード時に参照する Stage1 出力（prob_*.nc）ディレクトリ
+        - 各種劣化オプション（確率・範囲など）
+        - cache_size (int): サンプルキャッシュ数
+
+    処理:
+        - prepare_index_trainval/prepare_index_test で data_index を構築
+        - __getitem__ で入力(1ch, H, W) と教師(クラスID HxW) を返す
+
+    出力:
+        - __getitem__ -> (x_tensor: FloatTensor[1,H,W], y_tensor: LongTensor[H,W], time_str: str)
+    """
     def __init__(self, months, nc_0p5_dir, mode='train', stage1_out_dir=None,
                  n_augment=8,
                  prob_dilation=0.8,
@@ -887,6 +1161,20 @@ class FrontalRefinementDataset(Dataset):
             self.prepare_index_test()
 
     def prepare_index_trainval(self):
+        """
+        概要:
+            train/val 用に GT 前線ファイルを走査し、時刻ごとに n_augment 回の劣化サンプルを作成するための
+            data_index を構築する。
+
+        入力:
+            なし
+
+        処理:
+            - 各時刻 t について aug_idx=0..n_augment-1 のエントリを作成
+
+        出力:
+            なし（self.data_index を更新）
+        """
         print_memory_usage("Before Stage2 prepare_index_trainval")
         for month in self.months:
             front_file = os.path.join(self.nc_0p5_dir, f"{month}.nc")
@@ -920,6 +1208,19 @@ class FrontalRefinementDataset(Dataset):
         gc.collect()
 
     def prepare_index_test(self):
+        """
+        概要:
+            test モードでは Stage1 出力の確率 NetCDF 群を走査し、各ファイルを1サンプルとして data_index を作成する。
+
+        入力:
+            なし
+
+        処理:
+            - stage1_out_dir 内の .nc を列挙し、time を取得して data_index に格納
+
+        出力:
+            なし（self.data_index を更新）
+        """
         print_memory_usage("Before Stage2 prepare_index_test")
         if not os.path.exists(self.stage1_out_dir):
             print(f"Stage1 出力ディレクトリ {self.stage1_out_dir} がありません。(Stage2)")
@@ -952,6 +1253,22 @@ class FrontalRefinementDataset(Dataset):
         gc.collect()
 
     def load_single_item(self, idx):
+        """
+        概要:
+            data_index[idx] をもとに、train/val は GT を劣化して入力を作成、test は Stage1 の argmax を入力として返す。
+
+        入力:
+            - idx (int): サンプル番号
+
+        処理:
+            - train/val: GT one-hot をクラスIDへ、確率的な劣化処理(degrade_front_data)を適用
+            - test: Stage1 の probabilities から argmax を取り入力クラスマップを作成、教師は0で埋める
+
+        出力:
+            - in_cls (np.ndarray[int64]): 入力クラスマップ (H,W)
+            - tgt_cls (np.ndarray[int64]): 教師クラスマップ (H,W)
+            - time_dt (pd.Timestamp|None): 時刻
+        """
         item = self.data_index[idx]
         if item.get('is_augmented', False) and 'front_file' in item:
             front_file = item['front_file']
@@ -988,9 +1305,36 @@ class FrontalRefinementDataset(Dataset):
             raise ValueError(f"Invalid data index item: {item}")
 
     def __len__(self):
+        """
+        概要:
+            サンプル数を返す。
+
+        入力:
+            なし
+
+        処理:
+            - data_index の長さを返却
+
+        出力:
+            - n (int)
+        """
         return len(self.data_index)
 
     def __getitem__(self, idx):
+        """
+        概要:
+            idx 番目の (入力1ch, 教師, 時刻文字列) を返す。
+
+        入力:
+            - idx (int)
+
+        処理:
+            - キャッシュを優先、無い場合は load_single_item
+            - 入力は float の (1,H,W)、教師は long の (H,W) に変換
+
+        出力:
+            - x_tensor (FloatTensor[1,H,W]), y_tensor (LongTensor[H,W]), time_str (str)
+        """
         if idx in self.cache:
             in_cls, tgt_cls, time_dt = self.cache[idx]
         else:
@@ -1007,6 +1351,21 @@ class FrontalRefinementDataset(Dataset):
         return x_tensor, y_tensor, time_str
 
     def create_irregular_shape(self, h, w, cy, cx, max_shape_size=16):
+        """
+        概要:
+            中心座標から BFS 風に拡張して不規則な形状の点集合を作る（劣化用の穴やフェイク前線に利用）。
+
+        入力:
+            - h, w (int): 画像サイズ
+            - cy, cx (int): 初期中心座標
+            - max_shape_size (int): 形状の最大ピクセル数
+
+        処理:
+            - 4近傍で確率的に拡張し、座標集合を返す
+
+        出力:
+            - shape_points (List[Tuple[int,int]]): (y,x) の座標リスト
+        """
         visited = set()
         visited.add((cy, cx))
         queue = deque()
@@ -1028,6 +1387,22 @@ class FrontalRefinementDataset(Dataset):
         return shape_points
 
     def degrade_front_data(self, cls_map):
+        """
+        概要:
+            クラスマップに対し、膨張やギャップ作成、ランダム置換、偽前線追加等の劣化を施す。
+
+        入力:
+            - cls_map (np.ndarray[int]): (H,W) 0..5 のクラスID
+
+        処理:
+            - dilation（確率的）
+            - create_gaps（穴あけ）
+            - random pixel change（形状ごとクラス変更）
+            - add_fake_front（背景に擬似前線追加）
+
+        出力:
+            - degraded (np.ndarray[int]): 劣化後クラスマップ
+        """
         degraded = cls_map.copy()
         for c in [1,2,3,4,5]:
             mask = (degraded == c).astype(np.uint8)
@@ -1085,9 +1460,21 @@ class FrontalRefinementDataset(Dataset):
 
 class DiffusionTrainDataset(Dataset):
     """
-    拡散モデル学習用のunpairedデータセット
-    - 入力: 前線GT (nc_0p5_dir の各月ファイル) -> クラスマップ(0..5) -> one-hot 6ch
-    - 出力: (x_tensor, time_str)  ここで x_tensor は (6, H, W) in {0,1}
+    概要:
+        拡散モデル（DiffusionCorrector）学習用の unpaired データセット。
+        GT 前線（0/1 ラスタ）をクラスID(0..5)に変換し、6チャネルの one-hot (0/1) を作成する。
+
+    入力:
+        - months (List[str]): 対象年月のリスト（YYYYMM）
+        - nc_0p5_dir (str): GT 前線 NetCDF のディレクトリ
+        - cache_size (int): サンプルキャッシュ数
+
+    処理:
+        - _prepare_index() で全時刻を走査して data_index を構築
+        - __getitem__ で (6,H,W) の one-hot テンソルと時刻文字列を返す
+
+    出力:
+        - __getitem__ -> (x_tensor: FloatTensor[6,H,W] in {0,1}, time_str: str)
     """
     def __init__(self, months, nc_0p5_dir, cache_size=50):
         self.months = months
@@ -1100,6 +1487,20 @@ class DiffusionTrainDataset(Dataset):
         self._prepare_index()
 
     def _prepare_index(self):
+        """
+        概要:
+            months 内の各ファイルを走査し、全時刻を data_index に登録する。
+
+        入力:
+            なし
+
+        処理:
+            - lat/lon の初期化
+            - front_file と time を記録
+
+        出力:
+            なし（内部更新）
+        """
         for month in self.months:
             front_file = os.path.join(self.nc_0p5_dir, f"{month}.nc")
             if not os.path.exists(front_file):
@@ -1123,15 +1524,45 @@ class DiffusionTrainDataset(Dataset):
         print(f"[Stage2-Diff] 学習用インデックス: {len(self.data_index)} サンプル")
 
     def __len__(self):
+        """
+        概要:
+            サンプル総数を返す。
+        入力: なし
+        出力: (int)
+        """
         return len(self.data_index)
 
     def _labels_to_one_hot(self, labels, num_classes=6):
+        """
+        概要:
+            クラスIDマップ (H,W) を one-hot (C,H,W) に変換する。
+
+        入力:
+            - labels (np.ndarray[int64]): (H,W) 0..C-1
+            - num_classes (int): C
+
+        出力:
+            - oh (np.ndarray[float32]): (C,H,W) in {0,1}
+        """
         # labels: (H, W) int64
         oh = np.eye(num_classes, dtype=np.float32)[labels]  # (H, W, C)
         oh = np.transpose(oh, (2, 0, 1))  # (C, H, W)
         return oh
 
     def __getitem__(self, idx):
+        """
+        概要:
+            idx 番目の one-hot 6ch と時刻を返す。
+
+        入力:
+            - idx (int)
+
+        処理:
+            - キャッシュ優先、無ければ NetCDF 読み込み → クラスID → one-hot 化
+
+        出力:
+            - x_tensor (FloatTensor[6,H,W]), time_str (str)
+        """
         if idx in self.cache:
             x_tensor, time_str = self.cache[idx]
             return x_tensor, time_str
@@ -1160,9 +1591,14 @@ class DiffusionTrainDataset(Dataset):
 
 class Stage1ProbDataset(Dataset):
     """
-    Stage1 の確率出力 (prob_*.nc) を読み出す推論用データセット
-    - 出力: (prob_tensor, time_str)
-      prob_tensor: (C=6, H, W) float32 in [0,1]
+    概要:
+        Stage1 の確率出力 (prob_*.nc) を読み出す推論用データセット。
+
+    入力:
+        - stage1_out_dir (str): prob_*.nc のディレクトリ
+
+    出力:
+        - __getitem__ -> (prob_tensor: FloatTensor[6,H,W] in [0,1], time_str: str)
     """
     def __init__(self, stage1_out_dir):
         self.stage1_out_dir = stage1_out_dir
@@ -1184,9 +1620,28 @@ class Stage1ProbDataset(Dataset):
         print(f"[Stage2-Diff] 推論用インデックス: {len(self.data_index)} サンプル")
 
     def __len__(self):
+        """
+        概要:
+            サンプル総数を返す。
+        入力: なし
+        出力: (int)
+        """
         return len(self.data_index)
 
     def __getitem__(self, idx):
+        """
+        概要:
+            idx 番目の確率テンソル (C,H,W) と時刻文字列を返す。
+
+        入力:
+            - idx (int)
+
+        処理:
+            - NetCDF から (H,W,C) を読み、(C,H,W) に転置し Tensor 化
+
+        出力:
+            - (prob_tensor, time_str)
+        """
         item = self.data_index[idx]
         nc_path = item['nc_path']
         time_dt = item['time_dt']
@@ -1205,13 +1660,24 @@ class Stage1ProbDataset(Dataset):
 
 def run_stage2_diffusion():
     """
-    Stage2 を拡散モデル（DiffusionCorrector）ベースに差し替えた学習・推論パイプライン
-    改善点:
-      - 学習ログを保存（loss_history.csv, loss_curve.png）
-      - train/val分割＋早期停止＋最良モデル保存
-      - PSDに基づく t_start 推定（S1/GTのPSD比から閾値0.1で決定）
-      - アンサンブル生成＋PMM（クラス毎に順位一致置換）→確率正規化
-    出力NetCDFは従来と同じ: probabilities[lat,lon,class], refined_*.nc
+    概要:
+        Stage2 を拡散モデル（DiffusionCorrector）ベースに差し替えた学習・推論パイプライン。
+        学習（unpaired, one-hot）と推論（Stage1確率→逆拡散補正）を行い、refined_*.nc を出力する。
+
+    入力:
+        なし（CFG 参照）
+
+    処理:
+        - DiffusionTrainDataset を train/val に分割し、AdamW で学習（早期停止, 勾配クリップ, 再開対応）
+        - 最良モデルを保存（diffusion_model_final.pth）し、学習曲線/CSV を保存
+        - PSD 比（S1 vs GT）に基づく t_start を推定（閾値 psd_ratio_threshold）
+        - 推論では Stage1 の確率を初期分布として、逆拡散を ensemble 回サンプル
+        - PMM（Probability Matched Mean）でクラス毎の分布特性を維持した合成を実施
+        - NetCDF に probabilities[lat,lon,class] で refined_*.nc を保存
+
+    出力:
+        - v2_result 配下に学習成果物（checkpoint, loss_curve.png, loss_history.csv, diffusion_model_final.pth）
+        - stage2_nc に refined_*.nc
     """
     print_memory_usage("Start Stage 2 (Diffusion)")
     stage2_start = time.time()
@@ -1574,6 +2040,22 @@ def run_stage2_diffusion():
 
 
 def evaluate_stage3(stage2_nc_dir, save_nc_dir):
+    """
+    概要:
+        Stage2 出力の確率から argmax でクラスマップを作り、スケルトン化した結果を NetCDF に保存する。
+
+    入力:
+        - stage2_nc_dir (str): Stage2 NetCDF ディレクトリ
+        - save_nc_dir (str): 出力先ディレクトリ
+
+    処理:
+        - refined_*.nc を順次読み、class_map を生成
+        - skimage.morphology.skeletonize で 1ピクセル幅の骨格抽出
+        - 結果を class_map として保存
+
+    出力:
+        - なし（ファイル出力/ログ）
+    """
     print_memory_usage("Before evaluate_stage3")
     evaluate_start = time.time()
     setup_start = time.time()
@@ -1639,6 +2121,19 @@ def evaluate_stage3(stage2_nc_dir, save_nc_dir):
     print_memory_usage("After evaluate_stage3")
 
 def run_stage3():
+    """
+    概要:
+        Stage3（スケルトン化）を実行。Stage2 の確率出力から前線骨格を抽出する。
+
+    入力:
+        なし
+
+    処理:
+        - evaluate_stage3 を呼び出し
+
+    出力:
+        - なし
+    """
     print_memory_usage("Start Stage 3")
     evaluate_stage3(stage2_nc_dir=stage2_out_dir, save_nc_dir=stage3_out_dir)
     torch.cuda.empty_cache()
@@ -1649,6 +2144,23 @@ def run_stage3():
 # 可視化
 # --------------------------------------------------
 def visualize_results(stage1_nc_dir,stage2_nc_dir,stage3_nc_dir,original_nc_dir,output_dir):
+    """
+    概要:
+        Stage1/2/3 と元データを並べて地図上に描画し、比較PNGを出力する。
+
+    入力:
+        - stage1_nc_dir, stage2_nc_dir, stage3_nc_dir (str): 各段の NetCDF 置き場
+        - original_nc_dir (str): 元の前線データ NetCDF 置き場
+        - output_dir (str): 画像出力先
+
+    処理:
+        - 共通時刻を抽出し、multiprocessing で並列描画
+        - 気圧偏差のコンター/塗りつぶし + 各クラスマップを pcolormesh でオーバレイ
+        - 低気圧中心(任意)をプロット
+
+    出力:
+        - output_dir に comparison_YYYYMMDDHHMM.png を保存
+    """
     print("可視化処理を開始します。")
     os.makedirs(output_dir,exist_ok=True)
 
@@ -1702,6 +2214,20 @@ def visualize_results(stage1_nc_dir,stage2_nc_dir,stage3_nc_dir,original_nc_dir,
     print("可視化処理が完了しました。")
 
 def process_single_time(args):
+    """
+    概要:
+        1つの時刻に対し、Stage1/2/3/GT を地図上で可視化し、比較PNGを保存する。
+
+    入力:
+        - args (tuple): 内部で展開される描画に必要なパラメータ一式
+
+    処理:
+        - NetCDF 読み取り、クラスマップ作成、GSM から気圧偏差を計算
+        - cartopy で背景地図、contour/contourf、pcolormesh を重ね描き
+
+    出力:
+        - PNG ファイル（存在済ならスキップ）
+    """
     import gc
     import matplotlib.pyplot as plt
     from matplotlib import gridspec
@@ -1942,6 +2468,20 @@ def process_single_time(args):
     gc.collect()
 
 def run_visualization():
+    """
+    概要:
+        Stage1/2/3 の結果をまとめて可視化し、PNG を出力する。
+
+    入力:
+        なし
+
+    処理:
+        - visualize_results を呼び出し
+        - GPUメモリ/キャッシュのクリーンアップ
+
+    出力:
+        - なし
+    """
     print_memory_usage("Start Visualization")
     vis_start = time.time()
 
@@ -1967,6 +2507,22 @@ def run_visualization():
     print_memory_usage("After Visualization")
 
 def compute_metrics(y_true, y_pred, labels):
+    """
+    概要:
+        予測と正解から Accuracy, Macro Precision/Recall/F1, Cohen's Kappa を計算する。
+
+    入力:
+        - y_true (np.ndarray): 1次元の正解ラベル
+        - y_pred (np.ndarray): 1次元の予測ラベル
+        - labels (List[int]): 評価に含めるラベル集合
+
+    処理:
+        - precision_recall_fscore_support を macro 平均で利用
+        - accuracy と kappa を算出
+
+    出力:
+        - (acc, macro_prec, macro_rec, macro_f1, kappa): いずれも数値（%はすでに換算済）
+    """
     acc = np.mean(y_true == y_pred) * 100
     macro_prec, macro_rec, macro_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, average='macro', zero_division=0)
@@ -1977,6 +2533,22 @@ def compute_metrics(y_true, y_pred, labels):
     return acc, macro_prec, macro_rec, macro_f1, kappa
 
 def run_evaluation():
+    """
+    概要:
+        2023年の Stage1/2/3 出力を対象に、共通時刻での総合評価図/ログを生成する。
+
+    入力:
+        なし（CFG のパスを参照）
+
+    処理:
+        - Stage1/2/3 の NetCDF を読み、argmax/クラスマップを取得
+        - 元データから GT を作成（±3h 許容で最近傍許容）
+        - 混同行列/各種メトリクス/比率やRMSEなどを計算
+        - 図 (evaluation_summary.png) と詳細ログ (evaluation_summary.log) を書き出し
+
+    出力:
+        - なし（ファイル出力）
+    """
     print("[Evaluation] Start evaluation for 2023 data (6 classes).")
 
     ratio_buf_s1 = {c:[] for c in range(1, CFG["STAGE1"]["num_classes"])}
@@ -2280,6 +2852,20 @@ def run_evaluation():
     print(f"[Evaluation] Done. Figure -> {out_fig}")
 
 def smooth_polyline(points, window_size=3):
+    """
+    概要:
+        ポリラインの座標列を移動平均で平滑化する。
+
+    入力:
+        - points (List[Tuple[float,float]]): (x,y) の点列
+        - window_size (int): 平滑化窓幅（奇数推奨）
+
+    処理:
+        - 各点を中心に前後 half 幅で平均を取りスムージング
+
+    出力:
+        - smoothed (List[Tuple[float,float]]): 平滑化後の点列
+    """
     if len(points) <= window_size:
         return points
     smoothed = []
@@ -2294,10 +2880,20 @@ def smooth_polyline(points, window_size=3):
 
 def extract_polylines_using_skan(class_map, lat, lon):
     """
-    各前線クラス（1～5）ごとに、該当する二値マスクからスケルトン抽出を試み、
-    得られた枝をポリラインとして抽出する。
-    小さな領域（例：128×128のうち1マスのみなど）ではSkeletonでエラーとなるため、
-    その場合、非ゼロ画素の重心を計算し、同一座標を２点用いてポリラインとして出力する。
+    概要:
+        スケルトン抽出ライブラリ(skan)を用いて、各クラス(1..5)の細線化ポリラインを抽出する。
+
+    入力:
+        - class_map (np.ndarray[int]): (H,W) クラスIDマップ（0=背景, 1..5=前線）
+        - lat (np.ndarray): 緯度配列（H）
+        - lon (np.ndarray): 経度配列（W）
+
+    処理:
+        - クラスごとに2値マスクを作り、Skeleton からパス座標を取得
+        - 小領域でスケルトンが失敗する場合は、重心点を2点で疑似ポリライン化
+
+    出力:
+        - polylines (List[Tuple[int, List[Tuple[float,float]]]]): (クラスID, [(lon,lat), ...]) の配列
     """
     polylines = []
     for c in range(1, 6):
@@ -2327,6 +2923,24 @@ def extract_polylines_using_skan(class_map, lat, lon):
     return polylines
 
 def save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3):
+    """
+    概要:
+        ポリライン（経緯度座標）を SVG の polyline として可視化し保存する。
+
+    入力:
+        - polylines (List[Tuple[int, List[Tuple[float,float]]]]): (クラスID, 点列)
+        - viewBox (Tuple[float,float,float,float]): (min_lon, min_lat, width, height)
+        - output_path (str): 保存先 SVG パス
+        - smoothing_window (int): 出力前に適用する平滑化窓幅
+
+    処理:
+        - 背景グリッド/目盛りを描画
+        - クラス色で polyline を描画（必要なら平滑化）
+        - SVG をファイル保存
+
+    出力:
+        - なし（ファイル出力）
+    """
     class_colors = {
         1: "#FF0000",   # 温暖前線（赤）
         2: "#0000FF",   # 寒冷前線（青）
@@ -2362,6 +2976,21 @@ def save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3):
     print("SVG saved:", output_path)
 
 def evaluate_stage4(stage3_nc_dir, output_svg_dir):
+    """
+    概要:
+        Stage3 のスケルトン化クラスマップをポリラインに変換し、SVG として出力する。
+
+    入力:
+        - stage3_nc_dir (str): skeleton_*.nc のディレクトリ
+        - output_svg_dir (str): SVG 出力先
+
+    処理:
+        - 各ファイルを読み、extract_polylines_using_skan でポリライン抽出
+        - viewBox を経緯度の最小/最大から算出し、SVG を保存
+
+    出力:
+        - なし（SVG ファイル）
+    """
     os.makedirs(output_svg_dir, exist_ok=True)
     skeleton_files = sorted([f for f in os.listdir(stage3_nc_dir) if f.startswith("skeleton_") and f.endswith(".nc")])
     
@@ -2392,6 +3021,19 @@ def evaluate_stage4(stage3_nc_dir, output_svg_dir):
         gc.collect()
 
 def run_stage4():
+    """
+    概要:
+        Stage4（SVG 出力）を実行。Stage3 の骨格結果をベクタ形式に変換する。
+
+    入力:
+        なし
+
+    処理:
+        - evaluate_stage4 を呼び出し
+
+    出力:
+        - なし
+    """
     stage3_nc_dir = stage3_out_dir
     output_svg_dir = CFG["PATHS"]["stage4_svg_dir"]
     evaluate_stage4(stage3_nc_dir, output_svg_dir)
@@ -2405,6 +3047,22 @@ def _rss_mb():  return psutil.Process(os.getpid()).memory_info().rss/1024/1024
 def _gpu_mb():  return torch.cuda.memory_allocated()/1024/1024 if torch.cuda.is_available() else 0
 def _mem(tag):  print(f"[Mem] {tag:18s}  CPU:{_rss_mb():7.1f}MB  GPU:{_gpu_mb():7.1f}MB")
 def _load_model(ckpt:str, device):
+    """
+    概要:
+        学習済み Stage1 モデルをチェックポイントからロードし、推論モードで返す。
+
+    入力:
+        - ckpt (str): チェックポイントパス（model_final.pth など）
+        - device (torch.device): 配置デバイス
+
+    処理:
+        - SwinUnetModel を構築し state_dict を読み込み
+        - DataParallel 由来の "module." プレフィックスを除去
+        - eval()/no-grad 用に requires_grad=False を設定
+
+    出力:
+        - net (nn.Module): ロード済みモデル（eval）
+    """
     # Avoid self-import; directly construct the wrapper model
     net = SwinUnetModel(num_classes=CFG["STAGE1"]["num_classes"], in_chans=CFG["STAGE1"]["in_chans"], model_cfg=CFG["STAGE1"]["model"])
     obj = torch.load(ckpt, map_location="cpu")
@@ -2416,6 +3074,19 @@ def _load_model(ckpt:str, device):
     return net
 _gsm_base=None
 def _gsm_vars():
+    """
+    概要:
+        GSM NetCDF の最初のファイルから変数名リストを抽出（キャッシュ）する。
+
+    入力:
+        なし
+
+    処理:
+        - nc_gsm_dir/gsm*.nc の先頭ファイルを開き data_vars を列挙
+
+    出力:
+        - 変数名リスト (List[str])
+    """
     global _gsm_base
     if _gsm_base is None:
         import xarray as xr, glob
@@ -2424,6 +3095,20 @@ def _gsm_vars():
     return _gsm_base
 VAR_NAMES_93=[f"{v}_{t}" for t in("t-6h","t0","t+6h") for v in _gsm_vars()]
 class OnlineMoments:
+    """
+    概要:
+        特徴量ごとの |SHAP| 平均、符号付き平均、分散（からの標準偏差）を逐次更新で推定するユーティリティ。
+
+    入力:
+        - n_feat (int): 特徴量数（93）
+
+    処理:
+        - update(arr): (C,H,W) の SHAP を受け取り、チャネル平均を逐次統計に反映
+        - ave_abs()/ave()/std(): 推定値を返す
+
+    出力:
+        - プロパティ様の各メソッドで数値配列を返却
+    """
     def __init__(self, n_feat=93):
         self.n=0
         self.mu  = np.zeros(n_feat, dtype=np.float64)
@@ -2431,6 +3116,16 @@ class OnlineMoments:
         self.raw = np.zeros(n_feat, dtype=np.float64)
 
     def _to_CHW(self, arr:np.ndarray)->np.ndarray:
+        """
+        概要:
+            入力配列を (C,H,W) に整形する（末尾がチャネルなら転置）。
+
+        入力:
+            - arr (np.ndarray or Tensor): 3次元の SHAP 配列
+
+        出力:
+            - arr_chw (np.ndarray): (C,H,W)
+        """
         arr = np.squeeze(arr) 
         if arr.ndim != 3:
             raise ValueError(f"Unexpected ndim: {arr.ndim}, shape={arr.shape}")
@@ -2441,6 +3136,13 @@ class OnlineMoments:
         return arr
 
     def update(self, arr):
+        """
+        概要:
+            SHAP 配列を受け取り、逐次統計（平均|SHAP|、平均、分散）を更新する。
+
+        入力:
+            - arr (np.ndarray|Tensor): (C,H,W) or (H,W,C) 形式
+        """
         if isinstance(arr, torch.Tensor):
             arr = arr.cpu().numpy()
         arr = self._to_CHW(arr)
@@ -2457,6 +3159,20 @@ class OnlineMoments:
     def ave(self):     return self.raw / max(self.n,1)
     def std(self):     return np.sqrt(self.M2 / max(self.n-1,1))
 def _save_summary(cls_tag, stats, X, S, out_dir):
+    """
+    概要:
+        クラス別の SHAP 集計結果をCSV/PNGで保存する（beeswarm/bar/waterfall）。
+
+    入力:
+        - cls_tag (str): クラス名の表示用
+        - stats (OnlineMoments): 逐次統計
+        - X (np.ndarray): 入力のチャネル平均 (N,93)
+        - S (np.ndarray): SHAP のチャネル平均 (N,93)
+        - out_dir (str): 出力ディレクトリ
+
+    出力:
+        - なし（ファイル出力）
+    """
     os.makedirs(out_dir, exist_ok=True)
     df=pd.DataFrame({"variable":VAR_NAMES_93,
                      "AveAbs_SHAP":stats.ave_abs(),
@@ -2484,6 +3200,16 @@ def _save_summary(cls_tag, stats, X, S, out_dir):
     plt.title(f"{cls_tag}  waterfall (sample0)"); plt.tight_layout()
     plt.savefig(csv.replace(".csv","_waterfall.png"),dpi=200); plt.close()
 def _pick_gpu(th=CFG["SHAP"]["free_mem_threshold_gb"]):
+    """
+    概要:
+        空きメモリ量がしきい値以上の GPU を選ぶ。満たさなければ None。
+
+    入力:
+        - th (float): 必要な空きメモリ(GB)
+
+    出力:
+        - device_id (int|None)
+    """
     if not torch.cuda.is_available(): return None
     best=-1; bid=None
     for i in range(torch.cuda.device_count()):
@@ -2491,6 +3217,15 @@ def _pick_gpu(th=CFG["SHAP"]["free_mem_threshold_gb"]):
         if free>best: best, bid = free, i
     return bid if best>=th else None
 def _safe_shap(expl,x,ns=16):
+    """
+    概要:
+        GPU OOM を避けるため、nsamples を半減しながら SHAP を再試行する。
+
+    入力:
+        - expl: shap.GradientExplainer
+        - x (Tensor): 入力 (1,B,C,H,W) の想定に準じる
+        - ns (int): 初期サンプル数
+    """
     while True:
         try:  return expl.shap_values(x,nsamples=ns)
         except RuntimeError as e:
@@ -2501,6 +3236,18 @@ def _safe_shap(expl,x,ns=16):
 def run_stage1_shap_evaluation_cpu(use_gpu=True,
                                    max_samples_per_class=500,
                                    out_root="./v2_result/shap_stage1"):
+    """
+    概要:
+        Stage1 モデルに対する SHAP 解析を行い、クラス別に重要度統計と可視化を保存する。
+
+    入力:
+        - use_gpu (bool): GPU を使うか（空き容量が足りなければCPU）
+        - max_samples_per_class (int): クラスごとの最大サンプル数
+        - out_root (str): 出力ルートディレクトリ
+
+    出力:
+        - なし（CSV/PNG 保存）
+    """
     print("\n========== Stage-1 SHAP 解析 ==========")
     months=get_available_months(2023,1,2023,12)
     ds = FrontalDatasetStage1(months, nc_gsm_dir, nc_0p5_dir)
@@ -2545,7 +3292,14 @@ def run_stage1_shap_evaluation_cpu(use_gpu=True,
 
 def format_time(seconds):
     """
-    秒数を時間形式に変換して文字列で返す関数
+    概要:
+        秒数を「X時間 Y分 Z.ZZ秒」の形式に整形して返す。
+
+    入力:
+        - seconds (float): 経過秒
+
+    出力:
+        - s (str): 整形済み文字列
     """
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -2557,6 +3311,16 @@ def format_time(seconds):
         return f"{seconds:.2f}秒"
 
 def main():
+    """
+    概要:
+        パイプライン全体（Stage1→SHAP→Stage2(Diffusion)→Stage3→可視化→評価→動画→Stage4）を順次実行するエントリポイント。
+
+    入力:
+        なし
+
+    出力:
+        - なし（副作用として成果物の保存/ログ出力）
+    """
     total_start_time = time.time()
     print_memory_usage("Start main")
     stage1_start = time.time()
