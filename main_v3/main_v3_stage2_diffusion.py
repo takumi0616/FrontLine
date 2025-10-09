@@ -1,3 +1,19 @@
+"""
+概要:
+    Stage2（拡散モデルベースの補正器）の学習・推論を行うモジュール。
+    - diffusion-model.py からクラスを動的ロードし、条件付き拡散によるクラス確率マップの補正を実施
+    - 学習は (条件=劣化クラスマップ, 目標=GT の one-hot 確率) のペアで行い、推論は Stage1 確率を条件に生成
+
+構成:
+    - _load_diffusion_corrector(): DiffusionCorrector クラスを探索して動的ロード
+    - _load_diffusion_module(): ConditionalDiffusionCorrector を含むモジュールを動的ロード
+    - run_stage2_diffusion(): データセット準備、学習、推論（.nc 出力）まで一括実行
+
+注意:
+    - 依存する diffusion-model.py の位置は複数候補から探索される
+    - ハイパーパラメータは main_v3_config.CFG["STAGE2"]["diffusion"] を参照
+"""
+
 import os
 import gc
 import time
@@ -21,15 +37,22 @@ from main_v3_datasets import FrontalRefinementDataset, Stage2DiffusionTestDatase
 
 def _load_diffusion_corrector():
     """
-    Load DiffusionCorrector class from diffusion-model.py.
+    概要:
+        diffusion-model.py から DiffusionCorrector クラスを動的に読み込み、参照を返す。
 
-    Search order:
-      1) src/FrontLine/main_v3/diffusion-model.py        (same dir as this file)
-      2) src/FrontLine/diffusion-model.py                (parent dir)
-      3) Absolute fallback: /home/takumi/docker_miniconda/src/FrontLine/diffusion-model.py
+    入力:
+        なし（関数内で候補パスを探索）
 
-    Raises:
-      FileNotFoundError if none are found.
+    処理:
+        - 次の優先順でファイルを探索し importlib でロード
+          1) src/FrontLine/main_v3/diffusion-model.py
+          2) src/FrontLine/diffusion-model.py
+          3) /home/takumi/docker_miniconda/src/FrontLine/diffusion-model.py
+        - 読み込んだモジュールが DiffusionCorrector を持つか検証
+
+    出力:
+        - DiffusionCorrector (type): 読み込んだクラスオブジェクト
+        - 見つからない場合は FileNotFoundError を送出
     """
     candidates = [
         Path(__file__).parent / "diffusion-model.py",
@@ -61,8 +84,19 @@ def _load_diffusion_corrector():
 
 def _load_diffusion_module():
     """
-    Load diffusion-model.py as a Python module object to access both
-    DiffusionCorrector and ConditionalDiffusionCorrector classes.
+    概要:
+        diffusion-model.py をモジュールとして動的ロードし、ConditionalDiffusionCorrector 等へアクセス可能にする。
+
+    入力:
+        なし（関数内で候補パスを探索）
+
+    処理:
+        - _load_diffusion_corrector と同様の候補パス探索
+        - ConditionalDiffusionCorrector が属性として存在するかを検証
+
+    出力:
+        - module (ModuleType): diffusion-model.py のモジュールオブジェクト
+        - 条件を満たさない場合は FileNotFoundError を送出
     """
     candidates = [
         Path(__file__).parent / "diffusion-model.py",
@@ -92,6 +126,25 @@ def _load_diffusion_module():
 
 
 def run_stage2_diffusion():
+    """
+    概要:
+        条件付き拡散モデル（ConditionalDiffusionCorrector）を用いて Stage2 の補正を学習・推論するエントリ関数。
+
+    入力:
+        なし（全て main_v3_config.CFG の設定を使用）
+
+    処理:
+        - 学習/検証データセット（FrontalRefinementDataset）を構築
+          入力: 劣化クラスマップ(1ch) → one-hot 化, 目標: GT クラスマップ → one-hot 化
+        - ConditionalDiffusionCorrector を動的ロード・初期化し、AdamW で学習
+        - 各エポックで学習損失/検証損失を集計しチェックポイント保存・最良重みを追跡
+        - 損失曲線PNGとCSVを保存
+        - 推論では Stage1 の確率 (6ch) を条件に correct_from_probs_cond で補正を生成
+          アンサンブル平均、クラス重み付け、Stage1 とのブレンドを適用して .nc として保存
+
+    出力:
+        なし（副作用としてモデル重み、損失曲線、refined_*.nc を保存）
+    """
     print_memory_usage("Start Stage 2 (Diffusion, Paired-Conditional)")
     stage2_start = time.time()
 
@@ -187,7 +240,21 @@ def run_stage2_diffusion():
     os.makedirs(model_s2_save_dir, exist_ok=True)
 
     def labels_to_one_hot(lbl: torch.Tensor, num_classes: int) -> torch.Tensor:
-        # lbl: (B,H,W) long -> (B,C,H,W) float in {0,1}
+        """
+        概要:
+            整数ラベルマップ (B,H,W) を one-hot テンソル (B,C,H,W) に変換する。
+
+        入力:
+            - lbl (Tensor): 形状 (B,H,W) の整数クラスラベル（0..C-1）
+            - num_classes (int): クラス数 C
+
+        処理:
+            - torch.nn.functional.one_hot で (B,H,W,C) を得て (B,C,H,W) に次元並べ替え
+            - float 型に変換
+
+        出力:
+            - oh (Tensor): 形状 (B,C,H,W) の {0,1} one-hot テンソル
+        """
         oh = torch.nn.functional.one_hot(lbl.long(), num_classes=num_classes)  # (B,H,W,C)
         return oh.permute(0, 3, 1, 2).contiguous().float()
 

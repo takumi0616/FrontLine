@@ -1,3 +1,15 @@
+"""
+概要:
+    Stage1（Swin-UNet）学習・評価・推論をまとめた実行モジュール。
+    - 学習/検証ループ、チェックポイント保存、損失曲線の出力、NetCDF への確率保存までを提供
+    - 関数ごとに入力/処理/出力を明記し、他ステージやスクリプトから再利用しやすい構成
+
+構成:
+    - train_stage1_one_epoch(): 1エポック分の学習
+    - test_stage1_one_epoch(): 1エポック分の検証（学習なし）
+    - evaluate_stage1(): 推論・基本指標算出・確率の .nc 出力
+    - run_stage1(): データセット構築から学習・評価・エクスポートまで一括実行
+"""
 import os
 import re
 import gc
@@ -19,6 +31,25 @@ from main_v3_models import SwinUnetModel, combined_loss
 
 
 def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
+    """
+    概要:
+        Stage1 学習の1エポック分を実行し、損失と簡易精度を集計する関数。
+
+    入力:
+        - model (torch.nn.Module): 学習対象の Stage1 モデル（SwinUnetModel）
+        - dataloader (torch.utils.data.DataLoader): 学習データローダ（(x,y,time) を返す）
+        - optimizer (torch.optim.Optimizer): 最適化器（AdamW など）
+        - epoch (int): 現在のエポック番号（0 始まり）
+        - num_classes (int): クラス数（6）
+
+    処理:
+        - 各バッチで forward -> 損失計算(CE+Dice) -> backward -> step
+        - 10バッチごとに移動平均損失を tqdm に表示
+        - 予測の argmax による各クラス正解数を集計
+
+    出力:
+        - avg_epoch_loss (float): そのエポックの平均損失
+    """
     print_memory_usage(f"Before Stage1 train epoch={epoch+1}")
     model.train()
     running_loss = 0.0
@@ -65,6 +96,24 @@ def train_stage1_one_epoch(model, dataloader, optimizer, epoch, num_classes):
 
 
 def test_stage1_one_epoch(model, dataloader, epoch, num_classes):
+    """
+    概要:
+        学習を行わずに検証データで1エポック分の評価を実施し、平均損失と簡易精度を返す。
+
+    入力:
+        - model (torch.nn.Module): 評価対象の Stage1 モデル
+        - dataloader (torch.utils.data.DataLoader): 検証データローダ
+        - epoch (int): 現在のエポック番号（0 始まり）
+        - num_classes (int): クラス数（6）
+
+    処理:
+        - torch.no_grad() 下で全バッチを推論
+        - CE+Dice の合計損失を平均化
+        - 予測の argmax と GT から各クラスの正解数/総数をカウント
+
+    出力:
+        - avg_loss (float): 平均損失
+    """
     print_memory_usage(f"Before Stage1 test epoch={epoch+1}")
     model.eval()
     test_loss = 0.0
@@ -99,6 +148,25 @@ def test_stage1_one_epoch(model, dataloader, epoch, num_classes):
 
 
 def evaluate_stage1(model, dataloader, save_nc_dir=None):
+    """
+    概要:
+        学習済み Stage1 モデルで推論を実行し、基本指標（精度/適合率/再現率/F1）を表示。
+        さらに各時刻サンプルのクラス確率 (H,W,C=6) を NetCDF として保存する（任意）。
+
+    入力:
+        - model (torch.nn.Module): 評価対象の Stage1 モデル
+        - dataloader (torch.utils.data.DataLoader): 評価データローダ（(x,y,time)）
+        - save_nc_dir (str|None): 結果 .nc を保存するディレクトリ。None なら保存しない
+
+    処理:
+        - 推論ループで softmax 確率と argmax クラスを蓄積
+        - sklearn の precision_recall_fscore_support を用いて各クラス指標を計算
+        - 保存指定がある場合、各サンプルを xarray.Dataset として
+          dims=(lat, lon, class), coords=(lat, lon, class, time) で .nc に保存
+
+    出力:
+        - なし（標準出力とファイル出力の副作用のみ）
+    """
     print_memory_usage("Before evaluate_stage1")
     evaluate_start = time.time()
 
@@ -185,6 +253,24 @@ def evaluate_stage1(model, dataloader, save_nc_dir=None):
 
 
 def run_stage1():
+    """
+    概要:
+        Stage1 のフルパイプラインを実行するラッパ関数。
+        データセット構築 → モデル初期化/再開 → 学習/検証ループ → ベスト保存 → 評価/書き出し を包括。
+
+    入力:
+        - なし（動作は main_v3_config.CFG の設定に依存）
+
+    処理:
+        - 学習/テストの月範囲から Dataset/DataLoader を構築
+        - モデル/オプティマイザ初期化とチェックポイント再開
+        - 各エポックで train/test を実行し、最良モデルを追跡・保存
+        - 損失曲線 PNG と loss_history.csv を保存
+        - ベストモデルで evaluate_stage1 を呼び出し、Stage1 出力を .nc として保存
+
+    出力:
+        - なし（副作用としてモデル/図表/CSV/.nc を保存）
+    """
     print_memory_usage("Start Stage 1")
     stage1_start = time.time()
 

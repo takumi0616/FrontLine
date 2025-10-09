@@ -1,3 +1,20 @@
+"""
+概要:
+    評価関連のユーティリティと総合評価の実行関数を提供するモジュール。
+    - 混同行列や Accuracy / Macro Precision / Recall / F1 / Cohen's Kappa の集計と可視化
+    - Front vs None の AUC / AP、季節別通過頻度、予測骨格から GT までの距離統計の算出
+    - ステージ横断（Stage1/2/3）のサマリー図およびログの生成
+
+構成:
+    - compute_metrics(y_true, y_pred, labels): 1次元ラベルから基本指標を計算
+    - compute_seasonal_crossing_rates(stage3_nc_dir, ...): 月次・季節別の通過頻度 CSV を出力
+    - compute_distance_stats(stage3_nc_dir, gt_dir, ...): 予測骨格→GT の距離統計 CSV を出力
+    - run_evaluation(): 全評価を実行し、PNG/CSV/LOG を保存
+
+注意:
+    - 入出力のディレクトリや対象年などは main_v3_config.CFG に依存
+    - 計算/入出力コストが高いため、必要な年・ファイルに絞って実行すること
+"""
 import os
 import time
 from datetime import datetime
@@ -30,6 +47,24 @@ from main_v3_config import (
 
 
 def compute_metrics(y_true, y_pred, labels):
+    """
+    概要:
+        予測ラベルと正解ラベルから分類指標を計算して返すユーティリティ関数。
+        全画素を対象とした Accuracy、Macro Precision/Recall/F1、Cohen's Kappa を算出する。
+
+    入力:
+        - y_true (np.ndarray | Iterable[int]): 正解ラベルの1次元配列（長さN）
+        - y_pred (np.ndarray | Iterable[int]): 予測ラベルの1次元配列（長さN）
+        - labels (Sequence[int]): 評価対象とするラベルIDの集合（例: range(6)）
+
+    処理:
+        - Accuracy = (y_true == y_pred) の平均 × 100
+        - precision_recall_fscore_support(..., average="macro") で各指標を計算し ×100
+        - cohen_kappa_score でクラス間一致度を算出
+
+    出力:
+        - (acc, macro_prec, macro_rec, macro_f1, kappa): いずれも float（%は0-100スケール）
+    """
     acc = np.mean(y_true == y_pred) * 100.0
     macro_prec, macro_rec, macro_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, average="macro", zero_division=0
@@ -47,15 +82,31 @@ def compute_seasonal_crossing_rates(
     out_csv_season=os.path.join(os.path.dirname(output_visual_dir), "seasonal_rates.csv"),
 ):
     """
-    Stage3（骨格 class_map）を用いて、月別・季節別の通過頻度を算出する。
-    方法（簡易版）:
-      - 各時刻の class_map>0 の画素を「その日の通過」とみなす
-      - 同一セルで同日中は重複カウントしない（24hブランキングに近似）
-      - 月内の「日次カウント/日数」をセル平均して月次レートとする
-      - 季節（DJF, MAM, JJA, SON）は月次から集計
+    概要:
+        Stage3 で出力された骨格 class_map（H,W の整数クラスマップ）を用いて、
+        月別・季節別の「通過頻度」を集計し CSV に保存する。
+
+    入力:
+        - stage3_nc_dir (str): Stage3 の出力 .nc が格納されたディレクトリ
+                               期待するファイル名形式: "skeleton_YYYYMMDDHHMM.nc"
+        - out_csv_month (str): 月次の通過頻度を保存する CSV パス
+                               （デフォルト: .../seasonal_monthly_rates.csv）
+        - out_csv_season (str): 季節別の通過頻度を保存する CSV パス
+                                （デフォルト: .../seasonal_rates.csv）
+
+    処理:
+        - ディレクトリ内の "skeleton_*.nc" を列挙し、time をキーに月ごとにグルーピング
+        - 各ファイルについて class_map>0 を「前線が存在」とみなし 2値化
+        - 同一セルで同日中の重複は数えない簡易ルール（24h ブランキング近似）で日次カウント
+        - 各月について「日次カウント/日数」をセル平均し、月次レート（0-1）を算出
+        - 季節（DJF, MAM, JJA, SON）ごとに月次値を集計し平均レートを算出
+
     出力:
-      - 月次: year, month, rate_mean
-      - 季節: year, season(DJF/MAM/JJA/SON), rate_mean
+        - out_csv_month に以下の列を持つ CSV を保存:
+            year(int), month(int), rate_mean(float: 0-1)
+        - out_csv_season に以下の列を持つ CSV を保存:
+            year(int), season(str: DJF/MAM/JJA/SON), rate_mean(float: 0-1)
+        - 関数の戻り値はなし（ファイル出力の副作用）
     """
     os.makedirs(os.path.dirname(out_csv_month), exist_ok=True)
     files = sorted([f for f in os.listdir(stage3_nc_dir) if f.startswith("skeleton_") and f.endswith(".nc")])
@@ -137,11 +188,29 @@ def compute_distance_stats(
     out_csv=os.path.join(os.path.dirname(output_visual_dir), "distance_stats.csv"),
 ):
     """
-    距離評価（空間統計）:
-      - 各時刻で GT（5chの任意フロント）を2値化
-      - 予測（Stage3）骨格のセルから GT までの最近傍距離（ピクセル）を距離変換で算出
-      - 代表統計（mean/median/p90）を km 換算で出力
-    換算: グリッド解像度から近似。dx ≈ Δlon*111km*cos(lat_mean), dy ≈ Δlat*111km。
+    概要:
+        予測骨格（Stage3 の class_map>0）と GT 前線（5ch バイナリ）との空間距離を評価し、
+        最近傍距離の代表統計を km 単位で CSV に出力する。
+
+    入力:
+        - stage3_nc_dir (str): Stage3 の骨格 .nc フォルダ（"skeleton_*.nc" を想定）
+        - gt_dir (str): GT 前線 .nc フォルダ（"YYYYMM.nc" 単位で 5ch バイナリを格納）
+        - out_csv (str): 結果 CSV の保存先（デフォルト: .../distance_stats.csv）
+
+    処理:
+        - スペース解像度を lat/lon グリッドから近似し、1ピクセルの代表長さ pix_km を計算
+          近似: dy=Δlat*111km, dx=Δlon*111km*cos(lat_mean), pix_km=(dx+dy)/2
+        - 各時刻で:
+            1) 予測骨格（class_map>0）を2値化
+            2) 対応する GT 時刻（±3h 以内で最近傍）を見つけ、5ch をマージして2値化
+            3) GT の距離変換 EDT を計算し、予測骨格画素の距離を抽出
+            4) km に換算して mean/median/p90 を集計
+        - 各時刻ごとの統計を1行として rows に追加
+
+    出力:
+        - out_csv に以下の列を持つ CSV を保存:
+            time(str: "YYYY-mm-dd HH:MM"), mean_km(float), median_km(float), p90_km(float), count(int)
+        - 関数の戻り値はなし（ファイル出力の副作用）
     """
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     files = sorted([f for f in os.listdir(stage3_nc_dir) if f.startswith("skeleton_") and f.endswith(".nc")])
@@ -216,6 +285,24 @@ def compute_distance_stats(
 
 
 def run_evaluation():
+    """
+    概要:
+        Stage1/Stage2/Stage3 の結果を横断的に評価し、混同行列・各種指標・補助統計
+        （季節別通過頻度、距離統計、Front/None AUC/AP）を図表およびCSV/LOGに出力する。
+
+    入力:
+        なし（設定は main_v3_config.CFG と出力ディレクトリを参照）
+
+    処理:
+        - 年指定（CFG["EVAL"]["year"]）に該当するタイムスタンプのファイルを各ステージから収集
+        - 共通時刻に対して Stage1/2 の確率から予測クラスを作成、Stage3 は class_map を取得
+        - GT（5chバイナリ）をクラスマップに変換し、各ステージとの指標を計算
+        - まとめ図 evaluation_summary.png と、evaluation_summary.log を出力
+        - 追加で seasonal_*.csv、distance_stats.csv、front_none_metrics.csv を生成
+
+    出力:
+        なし（副作用としてPNG/CSV/LOGファイルを保存）
+    """
     year = CFG.get("EVAL", {}).get("year", 2023)
     print(f"[Evaluation] Start evaluation for {year} data (6 classes).")
 

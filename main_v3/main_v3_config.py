@@ -1,3 +1,19 @@
+"""
+概要:
+    v3 パイプライン全体で共有するグローバル設定（CFG）と、環境初期化・ユーティリティ関数を提供するモジュール。
+    - 学習/推論で用いるパス、ハイパーパラメータ、可視化・動画・SHAPなどの設定を一元管理する
+    - スレッド数、乱数シード、デバイス設定などの実行環境もここで初期化する
+
+構成:
+    - CFG: すべてのステージの設定ディクショナリ（PATHS/STAGE1/STAGE2/...）
+    - print_memory_usage(msg): 現プロセスのメモリ使用量（RSS）をMBで表示
+    - format_time(seconds): 秒を日本語の可読表記（h/m/s）に整形
+
+注意:
+    - 本モジュールを import するだけでスレッド数・シード・デバイス等が設定される
+    - 既存スクリプトとの互換性のため、情報表示の print は敢えて残している
+"""
+
 import os
 import sys
 import gc
@@ -213,11 +229,39 @@ except Exception:
     pass
 
 def print_memory_usage(msg: str = ""):
+    """
+    概要:
+        現在のPythonプロセスが使用している常駐集合サイズ（RSS）をMB単位で表示するユーティリティ。
+
+    入力:
+        - msg (str): 任意の識別メッセージ。出力行頭に付加される。
+
+    処理:
+        - psutil.Process(os.getpid()).memory_info().rss から使用メモリ（バイト）を取得
+        - 1024^2 で割ってMBに換算し、整形して標準出力にプリントする
+
+    出力:
+        なし（標準出力への副作用のみ）
+    """
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info().rss / 1024 / 1024
     print(f"[Memory] {msg} memory usage: {mem_info:.2f} MB")  # 現在プロセスのメモリ使用量表示
 
 def format_time(seconds: float) -> str:
+    """
+    概要:
+        秒数を人間が読みやすい日本語の時間表現（X時間 Y分 Z.ZZ秒 等）に整形して返す。
+
+    入力:
+        - seconds (float): 経過秒数
+
+    処理:
+        - divmod を用いて (時, 分, 秒) に分解
+        - 0 となる単位は省略し、最小限の単位で文字列として返す
+
+    出力:
+        - s (str): 整形済み時間文字列
+    """
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours > 0:

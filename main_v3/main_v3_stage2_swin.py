@@ -1,3 +1,19 @@
+"""
+概要:
+    Stage2（Swin-UNet ベースの補正器）の学習・評価・推論を行うモジュール。
+    - 入力は 1ch のクラスマップ（擬似劣化または Stage1 の argmax）を想定し、6クラスのロジットを出力
+    - 学習ループ、検証ループ、評価（混同行列など）、Stage1出力の再推論と .nc 保存を提供
+
+構成:
+    - train_stage2_one_epoch(): 1エポック分の学習
+    - test_stage2_one_epoch(): 1エポック分の検証
+    - evaluate_stage2(): 推論・評価・（任意で）refined_*.nc の保存
+    - run_stage2(): データセット構築から学習・評価・エクスポートまで一括実行
+
+注意:
+    - ハイパーパラメータや入出力パスは main_v3_config.CFG["STAGE2"] を参照
+    - FrontalRefinementDataset が train/val/test いずれのモードでも同一 API を提供する
+"""
 import os
 import re
 import gc
@@ -25,6 +41,27 @@ from main_v3_utils import get_available_months
 
 
 def train_stage2_one_epoch(model, dataloader, optimizer, epoch, num_classes):
+    """
+    概要:
+        Stage2 学習の1エポック分を実行し、損失と簡易精度を集計する。
+
+    入力:
+        - model (torch.nn.Module): 学習対象の Stage2 モデル（SwinUnetModelStage2）
+        - dataloader (torch.utils.data.DataLoader): 学習データローダ（(x,y,time) を返す）
+            - x: (B,1,H,W) float（1ch クラスマップ）
+            - y: (B,H,W) long（0..5 のクラスラベル）
+        - optimizer (torch.optim.Optimizer): 最適化器（AdamW など）
+        - epoch (int): 現在のエポック番号（0 始まり）
+        - num_classes (int): クラス数（6）
+
+    処理:
+        - forward -> 損失計算(CE+Dice) -> backward -> step
+        - 10バッチごとに移動平均損失を tqdm へ表示
+        - 予測 argmax と GT の一致から各クラスの正解数/総数を集計
+
+    出力:
+        - avg_epoch_loss (float): エポック平均損失
+    """
     print_memory_usage(f"Before Stage2 train epoch={epoch+1}")
     model.train()
     running_loss = 0.0
@@ -71,6 +108,23 @@ def train_stage2_one_epoch(model, dataloader, optimizer, epoch, num_classes):
 
 
 def test_stage2_one_epoch(model, dataloader, epoch, num_classes):
+    """
+    概要:
+        学習は行わず、検証データで1エポック分の評価（損失と簡易精度集計）を行う。
+
+    入力:
+        - model (torch.nn.Module): 評価対象の Stage2 モデル
+        - dataloader (torch.utils.data.DataLoader): 検証データローダ
+        - epoch (int): 現在のエポック番号（0 始まり）
+        - num_classes (int): クラス数（6）
+
+    処理:
+        - torch.no_grad() 下で forward と損失計算のみを実施
+        - 予測 argmax と GT の一致から各クラスの正解数/総数を集計
+
+    出力:
+        - avg_loss (float): 平均損失
+    """
     print_memory_usage(f"Before Stage2 test epoch={epoch+1}")
     model.eval()
     test_loss = 0.0
@@ -105,6 +159,24 @@ def test_stage2_one_epoch(model, dataloader, epoch, num_classes):
 
 
 def evaluate_stage2(model, dataloader, save_nc_dir=None):
+    """
+    概要:
+        学習済み Stage2 モデルで推論を行い、（GT がある場合は）混同行列や精度指標を出力。
+        必要に応じて各時刻サンプルのクラス確率 (H,W,C=6) を NetCDF 形式で保存する。
+
+    入力:
+        - model (torch.nn.Module): 評価対象の Stage2 モデル
+        - dataloader (torch.utils.data.DataLoader): 評価データローダ（(x,y,time)）
+        - save_nc_dir (str|None): refined_*.nc を保存するディレクトリ。None なら保存せず評価のみ
+
+    処理:
+        - 推論ループ: softmax 確率と argmax クラスを蓄積
+        - GT が含まれる場合、precision/recall/F1・混同行列を表示（GT が全0の場合はスキップ）
+        - 保存指定がある場合、dims=(lat, lon, class), coords=(lat, lon, class, time) で .nc 書き出し
+
+    出力:
+        なし（標準出力とファイル出力の副作用）
+    """
     print_memory_usage("Before evaluate_stage2")
     evaluate_start = time.time()
     model.eval()
@@ -188,6 +260,23 @@ def evaluate_stage2(model, dataloader, save_nc_dir=None):
 
 
 def run_stage2():
+    """
+    概要:
+        Stage2（Swin-UNet 補正器）のフルパイプラインを実行する。
+        データセット構築 → モデル初期化/再開 → 学習/検証ループ → ベスト保存 → 評価/書き出し を包括。
+
+    入力:
+        - なし（main_v3_config.CFG の設定に依存）
+
+    処理:
+        - train/val の FrontalRefinementDataset 構築（擬似劣化サンプルを生成）
+        - 各エポックで train/test を実行して損失を記録、最良モデルを追跡・保存
+        - 損失曲線 PNG と loss_history.csv を保存
+        - Stage1 出力（.nc）を test モードで読み、evaluate_stage2 で refined_*.nc を保存
+
+    出力:
+        - なし（副作用としてモデル/図表/CSV/.nc を保存）
+    """
     print_memory_usage("Start Stage 2")
     stage2_start = time.time()
 

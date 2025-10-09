@@ -1,3 +1,16 @@
+"""
+概要:
+    ステージ出力（Stage1/2/3）と元データ（前線 GT, GSM 由来の気圧偏差）を比較可視化し、
+    - 各時刻ごとの比較図（4枚並列）を PNG として出力
+    - 比較図を結合した月次・通年の動画を生成（低解像度版も作成）
+    - 並列処理により可視化を高速化
+
+構成:
+    - create_comparison_videos(...): comparison_*.png を月毎・通年動画に連結
+    - process_single_time(args): 単一時刻の比較図を生成するワーカ（Pool から呼ばれる）
+    - visualize_results(...): 入力 .nc 群を走査して比較図を一括生成（並列）
+    - run_visualization(): CFG の標準パスを用いて一連の可視化処理を実行し、処理時間・メモリを記録
+"""
 import os
 import gc
 import time
@@ -34,7 +47,28 @@ def create_comparison_videos(
     low_res_frame_rate: int = CFG["VIDEO"]["low_res_frame_rate"],
 ):
     """
-    comparison_YYYYMMDDHHMM.png を月毎＆通年の動画に連結し、低解像度版も作成
+    概要:
+        生成済みの比較画像 comparison_YYYYMMDDHHMM.png を時系列順に連結して動画を作成する。
+        月次動画（各月の全フレーム）と、通年動画（1月〜12月の全フレーム）を生成し、
+        さらに通年動画の低解像度版も ffmpeg を用いて作成する。
+
+    入力:
+        - image_folder (str): 比較画像 PNG（comparison_*.png）が格納されたフォルダ
+        - output_folder (str): 動画（.mp4）を出力するフォルダ
+        - frame_rate (int): 通常動画のフレームレート（fps）
+        - low_res_scale (int): 低解像度用の縮小倍率（画像幅・高さを 1/scale）
+        - low_res_frame_rate (int): 低解像度動画のフレームレート（fps）
+
+    処理:
+        - image_folder から comparison_*.png を列挙して月ごとにグルーピング
+        - 各月のフレームを OpenCV VideoWriter で mp4 に連結
+        - 通年分のフレームを連結した動画（フル解像度）を作成
+        - 一時フォルダに縮小版のフレームを書き出し、ffmpeg で低解像度動画を作成
+
+    出力:
+        - output_folder/comparison_YYYYMM.mp4（各月）
+        - output_folder/comparison_{year}_full_year.mp4（通年）
+        - output_folder/comparison_{year}_full_year_low.mp4（通年・低解像度）
     """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
@@ -123,7 +157,33 @@ def create_comparison_videos(
 
 def process_single_time(args):
     """
-    並列実行される単一時刻の可視化ワーカー
+    概要:
+        単一の時刻に対して、Stage1/Stage2/Stage3/GT を並べた比較画像を作成するワーカ関数。
+        並列実行（multiprocessing.Pool）で多数時刻を高速処理することを想定。
+
+    入力:
+        - args (Tuple[Any,...]): 下記13要素からなるタプル
+            0. time_str (str): "YYYYMMDDHHMM" 形式の時刻文字列
+            1. stage1_nc_path (str): Stage1 出力 .nc（probabilities: (time=1, lat, lon, class=6)）
+            2. stage2_nc_path (str): Stage2 出力 .nc（probabilities 同上）
+            3. stage3_nc_path (str): Stage3 出力 .nc（class_map: (time=1, lat, lon)）
+            4. original_nc_dir (str): 元の前線 GT .nc が格納されたディレクトリ（YYYYMM.nc）
+            5. nc_gsm_alt (str): GSM .nc ディレクトリ（海面更正気圧などの背景描画に使用）
+            6. out_dir (str): 出力 PNG ディレクトリ
+            7. class_colors (Dict[int,str]): クラスID→色コードの辞書
+            8. cmap (Colormap): 前線クラス表示用カラーマップ
+            9. norm (Normalize): 前線クラス表示用正規化器
+            10. pressure_levels (np.ndarray): 気圧偏差の等値線レベル
+            11. pressure_norm (Normalize): 気圧偏差のカラーマップ正規化器
+            12. cmap_pressure (Colormap): 気圧偏差のカラーマップ
+
+    処理:
+        - Stage1/2/3/GT を読み取り、クラスマップを PlateCarree で重畳表示（背景に気圧偏差）
+        - 低気圧中心（任意）があれば赤×で重畳
+        - 4つのサブプロット（Stage1/Stage2/Stage3/GT）とカラーバーを1枚にまとめて保存
+
+    出力:
+        なし（副作用として out_dir/comparison_{time_str}.png を保存）
     """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -376,7 +436,23 @@ def visualize_results(
     output_dir: str
 ):
     """
-    Stage1/2/3および元データを並べた比較画像 comparison_*.png を生成
+    概要:
+        Stage1/Stage2/Stage3/GT の共通時刻を抽出し、比較画像 comparison_*.png を一括生成する。
+
+    入力:
+        - stage1_nc_dir (str): Stage1 の .nc ディレクトリ（probabilities を格納）
+        - stage2_nc_dir (str): Stage2 の .nc ディレクトリ
+        - stage3_nc_dir (str): Stage3 の .nc ディレクトリ（class_map を格納）
+        - original_nc_dir (str): 元の前線 GT .nc ディレクトリ（YYYYMM.nc）
+        - output_dir (str): 比較画像の出力ディレクトリ
+
+    処理:
+        - 各ディレクトリの .nc を列挙し、ファイル名から共通の時刻キー集合を作成
+        - process_single_time の入力タプルを作り、最初の1件をシリアル実行（キャッシュ初期化のため）
+        - 残りを multiprocessing.Pool で並列実行して高速化
+
+    出力:
+        なし（副作用として output_dir/comparison_*.png を保存）
     """
     print("可視化処理を開始します。")
     os.makedirs(output_dir, exist_ok=True)
@@ -438,6 +514,21 @@ def visualize_results(
 
 
 def run_visualization():
+    """
+    概要:
+        可視化パイプラインのエントリ関数。CFG の標準パスを用いて比較図の生成を実行し、
+        所要時間とメモリ使用量をログ出力する。
+
+    入力:
+        なし（main_v3_config.CFG のパス設定に依存）
+
+    処理:
+        - visualize_results(...) を呼び出して比較図を一括生成
+        - CUDA キャッシュ解放と GC を実施
+
+    出力:
+        なし（副作用として PNG 群を保存）
+    """
     print_memory_usage("Start Visualization")
     vis_start = time.time()
 

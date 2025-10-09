@@ -1,3 +1,20 @@
+"""
+概要:
+    Stage4（SVG 出力）のモジュール。
+    - Stage3 で得た骨格クラスマップ（class_map, H×W, 値域0..5）をポリラインへ変換し、SVG で可視化する
+    - 線の平滑化、色分け、簡易グリッド描画、viewBox の自動設定などを行う
+
+構成:
+    - smooth_polyline(points, window_size): ポリラインの移動平均平滑化
+    - extract_polylines_using_skan(class_map, lat, lon): class_map をポリライン群へ変換（skan を使用）
+    - save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window): ポリラインを SVG で保存
+    - evaluate_stage4(stage3_nc_dir, output_svg_dir): skeleton_*.nc を一括処理して SVG 群を出力
+    - run_stage4(): CFG の出力先設定を用いた実行エントリ
+
+注意:
+    - 緯度・経度配列と画像添字の向きに差異があるため、元実装準拠で lon/lat は反転参照している箇所がある
+    - SVG の座標系は viewBox（min_lon, min_lat, width, height）で定義される
+"""
 import os
 import gc
 import numpy as np
@@ -12,6 +29,21 @@ from main_v3_config import CFG, stage3_out_dir, stage4_svg_dir
 
 
 def smooth_polyline(points, window_size=3):
+    """
+    概要:
+        ポリラインの座標列に移動平均的な平滑化を適用し、折れの激しい線を滑らかにする。
+
+    入力:
+        - points (List[Tuple[float,float]]): 座標列 [(x, y), ...]（地理座標を想定）
+        - window_size (int): 平滑化窓のサイズ（奇数を推奨）。各点の前後 half 幅で平均化
+
+    処理:
+        - 各点 i についてインデックス範囲 [i-half, i+half] を取り、その区間の x, y の平均を計算
+        - 端点では範囲を画像内にクリップし、点数は維持したまま平滑化
+
+    出力:
+        - smoothed (List[Tuple[float,float]]): 平滑化後の座標列
+    """
     if len(points) <= window_size:
         return points
     smoothed = []
@@ -27,8 +59,24 @@ def smooth_polyline(points, window_size=3):
 
 def extract_polylines_using_skan(class_map, lat, lon):
     """
-    各前線クラス（1～5）ごとに二値マスクから骨格抽出し、ポリライン群に変換する。
-    極小領域で Skeleton が失敗する場合は重心点のダブルポイントを返す。
+    概要:
+        Stage3 の骨格 class_map（0..5）の各クラスごとに、二値マスクから骨格パスを抽出し、
+        地理座標系（lon, lat）でのポリライン群へ変換する。
+
+    入力:
+        - class_map (np.ndarray): 形状 (H, W) の整数ラベル（0=背景, 1..5=前線）
+        - lat (np.ndarray): 形状 (H,) の緯度配列
+        - lon (np.ndarray): 形状 (W,) の経度配列
+
+    処理:
+        - 各クラス c=1..5 について class_map==c を二値化
+        - skan.Skeleton により骨格パスを列挙し、パス上の画像座標 (row, col) を最寄り整数に丸める
+        - 元コードとの互換のため lon[::-1], lat[::-1] を用いて (x=lon, y=lat) に変換
+        - 極小領域で骨格抽出が失敗した場合は、重心点のダブルポイント [pt, pt] を代用
+
+    出力:
+        - polylines (List[Tuple[int, List[Tuple[float,float]]]]):
+            [(cls_id, [(x1,y1), (x2,y2), ...]), ...] のリスト
     """
     from skan import Skeleton
     polylines = []
@@ -60,8 +108,24 @@ def extract_polylines_using_skan(class_map, lat, lon):
 
 def save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3):
     """
-    前線別色の polyline を持つシンプルな SVG を出力する。
-    viewBox = (min_lon, min_lat, width, height)
+    概要:
+        ポリライン群をクラス別色で描画したシンプルな SVG を生成・保存する。
+
+    入力:
+        - polylines (List[Tuple[int, List[Tuple[float,float]]]]):
+            [(cls_id, [(x,y), ...]), ...] 形式のポリライン集合
+        - viewBox (Tuple[float,float,float,float]):
+            (min_lon, min_lat, width, height) 形式の SVG viewBox
+        - output_path (str): 出力ファイルパス（.svg）
+        - smoothing_window (int): ポリラインの平滑化窓。None/1 で平滑化なし
+
+    処理:
+        - CFG["VISUALIZATION"]["class_colors"] に従いクラス別の stroke 色を選択
+        - graticule（簡易経緯線）と数値注記を描画
+        - 指定があれば smooth_polyline で座標列を平滑化し、polyline 要素を連結
+
+    出力:
+        なし（副作用として SVG ファイルを output_path に保存）
     """
     # 色指定は設定（VISUALIZATION.class_colors）から取得
     class_colors = CFG["VISUALIZATION"]["class_colors"]
@@ -95,7 +159,21 @@ def save_polylines_as_svg(polylines, viewBox, output_path, smoothing_window=3):
 
 def evaluate_stage4(stage3_nc_dir, output_svg_dir):
     """
-    Stage3 の骨格 class_map をポリライン化し、SVG として保存する。
+    概要:
+        skeleton_*.nc（Stage3 出力）の class_map を読み取り、各タイムスタンプごとに SVG を生成する。
+
+    入力:
+        - stage3_nc_dir (str): Stage3 の出力 .nc ディレクトリ（skeleton_*.nc）
+        - output_svg_dir (str): 出力 SVG ディレクトリ
+
+    処理:
+        - skeleton_*.nc を時系列順に走査
+        - class_map, lat, lon を取得して extract_polylines_using_skan でポリライン化
+        - lat/lon の範囲から viewBox を自動計算
+        - save_polylines_as_svg で各時刻の SVG を "skeleton_YYYYMMDDHHMM.svg" として保存
+
+    出力:
+        なし（副作用として SVG ファイル群を保存）
     """
     os.makedirs(output_svg_dir, exist_ok=True)
     skeleton_files = sorted([f for f in os.listdir(stage3_nc_dir) if f.startswith("skeleton_") and f.endswith(".nc")])
@@ -136,6 +214,20 @@ def evaluate_stage4(stage3_nc_dir, output_svg_dir):
 
 
 def run_stage4():
+    """
+    概要:
+        Stage4 のエントリ関数。CFG の標準パスに基づき、Stage3 の skeleton を SVG へ変換する。
+
+    入力:
+        なし（main_v3_config.CFG の出力設定を使用）
+
+    処理:
+        - evaluate_stage4(stage3_out_dir, stage4_svg_dir) を呼び出し一括生成
+        - 終了メッセージを出力
+
+    出力:
+        なし（副作用として SVG を生成）
+    """
     evaluate_stage4(stage3_out_dir, stage4_svg_dir)
     print("【Stage4 Improved】 SVG 出力処理が完了しました。")
 
