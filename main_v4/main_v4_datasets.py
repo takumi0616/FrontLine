@@ -942,17 +942,37 @@ class V4DatasetStage4Test(Dataset):
             if "junction" in ds:
                 j = ds["junction"]
                 arr = j.isel(time=0).values if "time" in j.dims else j.values
+                arr = np.asarray(arr)
                 arr = np.squeeze(arr).astype(np.float32)
-                if arr.ndim != 2:
-                    arr = np.squeeze(arr)
                 if arr.max() > 1.0:
                     arr = (arr > 0).astype(np.float32)
-                return arr
             else:
-                # 安全なフォールバック: 全0 (lat/lon 次元サイズがあればそれに合わせる)
-                h = ds.dims.get("lat", ORIG_H)
-                w = ds.dims.get("lon", ORIG_W)
-                return np.zeros((h, w), dtype=np.float32)
+                # 安全なフォールバック: 全0（サイズは lat/lon があればそれに合わせる）
+                h = int(ds.sizes.get("lat", ORIG_H))
+                w = int(ds.sizes.get("lon", ORIG_W))
+                arr = np.zeros((h, w), dtype=np.float32)
+
+            # 2D正規化 + 最終サイズを (ORIG_H, ORIG_W) に揃える（足りない部分は0で埋め、余剰は切り詰め）
+            if arr.ndim != 2:
+                h = int(ds.sizes.get("lat", ORIG_H))
+                w = int(ds.sizes.get("lon", ORIG_W))
+                arr2 = np.zeros((h, w), dtype=np.float32)
+                try:
+                    if arr.ndim == 1:
+                        lim = min(arr.size, h * w)
+                        arr2.ravel()[:lim] = arr.ravel()[:lim]
+                    else:
+                        hh = min(h, arr.shape[0]); ww = min(w, arr.shape[1])
+                        arr2[:hh, :ww] = arr[:hh, :ww]
+                except Exception:
+                    pass
+                arr = arr2
+
+            # 最終整形: (ORIG_H, ORIG_W)
+            out = np.zeros((ORIG_H, ORIG_W), dtype=np.float32)
+            hh = min(ORIG_H, arr.shape[0]); ww = min(ORIG_W, arr.shape[1])
+            out[:hh, :ww] = arr[:hh, :ww]
+            return out
         finally:
             ds.close()
 
@@ -975,16 +995,30 @@ class V4DatasetStage4Test(Dataset):
                 if wv is not None and cv is not None:
                     w_arr = wv.isel(time=0).values if "time" in wv.dims else wv.values
                     c_arr = cv.isel(time=0).values if "time" in cv.dims else cv.values
-                    w_arr = np.squeeze(w_arr)
-                    c_arr = np.squeeze(c_arr)
+                    w_arr = np.asarray(w_arr); c_arr = np.asarray(c_arr)
+                    w_arr = np.squeeze(w_arr);  c_arr = np.squeeze(c_arr)
                     warm = (w_arr > 0.5).astype(np.float32)
                     cold = (c_arr > 0.5).astype(np.float32)
                 else:
-                    h = ds.dims.get("lat", ORIG_H)
-                    w = ds.dims.get("lon", ORIG_W)
+                    h = int(ds.sizes.get("lat", ORIG_H))
+                    w = int(ds.sizes.get("lon", ORIG_W))
                     warm = np.zeros((h, w), dtype=np.float32)
                     cold = np.zeros((h, w), dtype=np.float32)
-            return warm, cold
+
+            # 2D正規化
+            if warm.ndim != 2:
+                warm = np.squeeze(warm)
+            if cold.ndim != 2:
+                cold = np.squeeze(cold)
+
+            # 最終整形: (ORIG_H, ORIG_W)
+            out_w = np.zeros((ORIG_H, ORIG_W), dtype=np.float32)
+            out_c = np.zeros((ORIG_H, ORIG_W), dtype=np.float32)
+            hh = min(ORIG_H, warm.shape[0]); ww = min(ORIG_W, warm.shape[1])
+            out_w[:hh, :ww] = warm[:hh, :ww]
+            hh = min(ORIG_H, cold.shape[0]); ww = min(ORIG_W, cold.shape[1])
+            out_c[:hh, :ww] = cold[:hh, :ww]
+            return out_w, out_c
         finally:
             ds.close()
 
@@ -1015,30 +1049,33 @@ class V4DatasetStage4Test(Dataset):
             arr = np.squeeze(arr)
 
             # 1次元の場合は lat/lon 次元から復元を試みる
-            if arr.ndim == 1 and ("lat" in ds.dims) and ("lon" in ds.dims):
-                h = int(ds.dims["lat"])
-                w = int(ds.dims["lon"])
+            if arr.ndim == 1 and ("lat" in ds.sizes) and ("lon" in ds.sizes):
+                h = int(ds.sizes["lat"])
+                w = int(ds.sizes["lon"])
                 if h * w == arr.size:
                     arr = arr.reshape(h, w)
 
-            # 最終ガード: 2次元へ正規化（失敗時はゼロ配列にフォールバック）
+            # 2D正規化（失敗時はゼロ配列へ）
             if arr.ndim != 2:
-                h = int(ds.dims.get("lat", ORIG_H))
-                w = int(ds.dims.get("lon", ORIG_W))
+                h = int(ds.sizes.get("lat", ORIG_H))
+                w = int(ds.sizes.get("lon", ORIG_W))
                 arr2 = np.zeros((h, w), dtype=np.float32)
                 try:
                     if arr.ndim == 1 and arr.size > 0:
-                        # 横方向に詰めることはせず、左上から可能な範囲だけ詰める（安全優先）
                         lim = min(arr.size, h * w)
                         arr2.ravel()[:lim] = arr.ravel()[:lim]
                     elif arr.ndim >= 2:
                         hh = min(h, arr.shape[0]); ww = min(w, arr.shape[1])
                         arr2[:hh, :ww] = arr[:hh, :ww]
-                    arr = arr2
                 except Exception:
-                    arr = arr2
+                    pass
+                arr = arr2
 
-            return arr
+            # 最終整形: (ORIG_H, ORIG_W) へパディング/クリップ
+            out = np.zeros((ORIG_H, ORIG_W), dtype=np.float32)
+            hh = min(ORIG_H, arr.shape[0]); ww = min(ORIG_W, arr.shape[1])
+            out[:hh, :ww] = arr[:hh, :ww]
+            return out
         finally:
             ds.close()
 

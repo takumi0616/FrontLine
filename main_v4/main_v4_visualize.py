@@ -32,6 +32,59 @@ from .main_v4_config import (
     stage4_out_dir, stage4_5_out_dir, final_out_dir,
 )
 
+def _setup_matplotlib_fonts_and_warnings():
+    """
+    日本語表示は japanize-matplotlib を優先して有効化し、グリフ欠落のUserWarningも抑止する。
+    japanize が使用できない場合は、CJKフォント自動選択ロジックでフォールバックする。
+    """
+    try:
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            message=r"Glyph .* missing from font\(s\) .*",
+        )
+        import matplotlib.pyplot as _plt
+
+        # 1) japanize-matplotlib を優先
+        try:
+            import japanize_matplotlib  # noqa: F401
+        except Exception:
+            # 2) フォールバック: 環境にあるCJKフォントを自動選択
+            import matplotlib.font_manager as _fm
+            installed = {f.name for f in _fm.fontManager.ttflist}
+            candidates = [
+                "Noto Sans CJK JP",
+                "Noto Sans JP",
+                "IPAexGothic",
+                "IPAPGothic",
+                "TakaoGothic",
+                "VL Gothic",
+                "Source Han Sans JP",
+                "Yu Gothic",
+                "Hiragino Sans",
+                "MS Gothic",
+                "Arial Unicode MS",
+            ]
+            chosen = None
+            for name in candidates:
+                if name in installed:
+                    chosen = name
+                    break
+            if chosen:
+                _plt.rcParams["font.sans-serif"] = [chosen, "DejaVu Sans"]
+            else:
+                _plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial Unicode MS"]
+
+        # マイナス記号の文字化け対策
+        _plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        # ベストエフォート。失敗しても可視化処理自体は継続させる
+        pass
+
+# モジュール読み込み時に一度だけ適用
+_setup_matplotlib_fonts_and_warnings()
+
 
 def _list_nc(dir_path: str, prefix: str = "", suffix: str = ".nc"):
     """
