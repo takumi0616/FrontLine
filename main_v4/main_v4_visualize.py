@@ -1,0 +1,517 @@
+"""
+概要:
+    v3 の可視化機能を v4 に導入。
+    - 各ステージ（1,1.5,2,2.5,3,3.5,4,4.5）終了ごとに、そのステージの成果物と GT を比較する可視化 PNG を出力する。
+    - 背景に海面更正気圧の偏差（GSM）を重畳、低気圧中心（存在すれば）を赤×で表示。
+    - 画像は output_visual_dir/{stage_name}/comparison_{stage_name}_{YYYYMMDDHHMM}.png に保存。
+
+注意:
+    - v4 の各ステージ出力はクラス数が異なるため、v3 と同じ 4 パネルではなく「Pred vs GT」の 2 パネルで表示する。
+    - カラーマップは CFG["VISUALIZATION"]["class_colors"] に従う。v4 側の予測クラスを 0..5 へマッピングして色づけする。
+    - GT は v3 同様に 5ch (warm, cold, stationary, occluded, warm_cold) から 0..5 へ集約。
+
+関数:
+    - run_visualization_for_stage(stage_name: str): 一括可視化（stage_name in {"stage1","stage1_5","stage2","stage2_5","stage3","stage3_5","stage4","stage4_5"}）
+"""
+
+import os
+import gc
+import time
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+from .main_v4_config import (
+    CFG, print_memory_usage, format_time,
+    nc_gsm_dir, nc_0p5_dir, output_visual_dir,
+    stage1_out_dir, stage1_5_out_dir,
+    stage2_out_dir, stage2_5_out_dir,
+    stage3_out_dir, stage3_5_out_dir,
+    stage4_out_dir, stage4_5_out_dir, final_out_dir,
+)
+
+
+def _list_nc(dir_path: str, prefix: str = "", suffix: str = ".nc"):
+    """
+    関数概要:
+      指定ディレクトリ配下の NetCDF ファイルを列挙し、任意の接頭辞/接尾辞でフィルタした上で
+      ファイル名の昇順リストを返すユーティリティ。
+
+    入力:
+      - dir_path (str): 走査対象のディレクトリパス
+      - prefix (str): ファイル名がこの接頭辞で始まるもののみ採用（空文字なら無条件）
+      - suffix (str): ファイル名がこの接尾辞で終わるもののみ採用（デフォルトは ".nc"）
+
+    処理:
+      - ディレクトリが存在しない場合は空リストを返す
+      - os.listdir で走査し、suffix と prefix 条件でフィルタ、昇順ソートして返す
+
+    出力:
+      - List[str]: 条件に合致したファイル名の昇順リスト
+    """
+    if not os.path.exists(dir_path):
+        return []
+    files = []
+    for f in os.listdir(dir_path):
+        if f.endswith(suffix) and (prefix == "" or f.startswith(prefix)):
+            files.append(f)
+    return sorted(files)
+
+
+def _time_token_from_prob_name(fname: str, prefix="prob_"):
+    """
+    関数概要:
+      Stage の確率出力ファイル名から時刻トークン（YYYYMMDDHHMM）を抽出する。
+
+    入力:
+      - fname (str): 例 "prob_YYYYMMDDHHMM.nc" 形式のファイル名
+      - prefix (str): 接頭辞（デフォルト "prob_"）
+
+    処理:
+      - 接頭辞と拡張子 ".nc" を取り除いてトークンを抽出
+
+    出力:
+      - str: "YYYYMMDDHHMM"
+    """
+    return fname.replace(prefix, "").replace(".nc", "")
+
+
+def _time_token_from_generic_name(fname: str, prefix: str):
+    """
+    関数概要:
+      任意のステージ出力ファイル名から、与えられた接頭辞を除去して時刻トークン（YYYYMMDDHHMM）を抽出する。
+
+    入力:
+      - fname (str): 例 "junction_YYYYMMDDHHMM.nc" や "refined_YYYYMMDDHHMM.nc" 等
+      - prefix (str): 接頭辞（例 "junction_", "refined_" など）
+
+    出力:
+      - str: "YYYYMMDDHHMM"
+    """
+    return fname.replace(prefix, "").replace(".nc", "")
+
+
+def _load_pressure_and_lowcenter(month_str: str, time_dt: pd.Timestamp):
+    """
+    GSM から海面更正気圧を読み、偏差と低気圧中心(mask)を返す。
+    低気圧中心は "surface_low_center" 変数があれば使用。
+    """
+    prmsl = None
+    low_mask = None
+    low_center_exists = False
+
+    gsm_file = os.path.join(nc_gsm_dir, f"gsm{month_str}.nc")
+    if not os.path.exists(gsm_file):
+        return None, None, low_center_exists
+
+    try:
+        ds = xr.open_dataset(gsm_file)
+        ds_times = pd.to_datetime(ds["time"].values)
+        if time_dt in ds_times:
+            dat = ds.sel(time=time_dt)
+        else:
+            timediffs = np.abs(ds_times - time_dt)
+            midx = timediffs.argmin()
+            if timediffs[midx] <= pd.Timedelta(hours=3):
+                dat = ds.sel(time=ds["time"].values[midx])
+            else:
+                ds.close()
+                return None, None, low_center_exists
+
+        if "surface_prmsl" in dat:
+            prmsl = dat["surface_prmsl"].values
+        if "surface_low_center" in ds:
+            try:
+                if time_dt in ds_times:
+                    lowcenter_arr = ds["surface_low_center"].sel(time=time_dt).values
+                else:
+                    lowcenter_arr = ds["surface_low_center"].sel(time=ds["time"].values[midx]).values
+                low_mask = (lowcenter_arr == 1)
+                low_center_exists = True
+            except Exception:
+                low_mask = None
+                low_center_exists = False
+        ds.close()
+    except Exception:
+        prmsl = None
+        low_mask = None
+        low_center_exists = False
+
+    if prmsl is None:
+        return None, None, low_center_exists
+
+    area_mean = np.nanmean(prmsl)
+    pressure_dev = prmsl - area_mean
+    return pressure_dev, low_mask, low_center_exists
+
+
+def _gt_class_map_for_time(time_dt: pd.Timestamp, lat: np.ndarray, lon: np.ndarray):
+    """
+    GT: 5ch (warm, cold, stationary, occluded, warm_cold) -> 0..5 class_map
+    """
+    month_str = time_dt.strftime("%Y%m")
+    gtf = os.path.join(nc_0p5_dir, f"{month_str}.nc")
+    h, w = len(lat), len(lon)
+    if not os.path.exists(gtf):
+        return np.zeros((h, w), dtype=np.int64)
+
+    ds = xr.open_dataset(gtf)
+    if time_dt in ds["time"]:
+        arr5 = ds.sel(time=time_dt).to_array().values  # (5,H,W)
+    else:
+        diff = np.abs(ds["time"].values - np.datetime64(time_dt))
+        idx = diff.argmin()
+        if diff[idx] <= np.timedelta64(3, "h"):
+            arr5 = ds.sel(time=ds["time"][idx]).to_array().values
+        else:
+            ds.close()
+            return np.zeros((h, w), dtype=np.int64)
+    ds.close()
+    gt = np.zeros((h, w), dtype=np.int64)
+    # 1:warm,2:cold,3:stationary,4:occluded,5:warm_cold
+    if arr5.shape[1] != h or arr5.shape[2] != w:
+        arr5 = arr5[:, :h, :w]
+    for c in range(5):
+        mask = (arr5[c] == 1)
+        gt[mask] = c + 1
+    return gt
+
+
+def _pred_class_map_for_stage(stage_name: str, nc_path: str):
+    """
+    v4 各ステージの出力 .nc を読み、0..5 の class_map に正規化して返す。
+    仕様: Stage1/1.5 で junction=5 を確定、Stage2/2.5 で warm=1/cold=2/junction=5 を確定。
+         以降のステージ表示では、確定済みを必ず重畳して見えるよう合成する（上書き禁止）。
+    """
+    ds = xr.open_dataset(nc_path)
+    time_val = ds["time"].values[0] if "time" in ds else None
+    t_dt = pd.to_datetime(time_val) if time_val is not None else None
+    lat = ds["lat"].values
+    lon = ds["lon"].values
+
+    h, w = len(lat), len(lon)
+    pred = np.zeros((h, w), dtype=np.int64)
+
+    def _prob_argmax(dsvar):
+        prob = dsvar.isel(time=0).values  # (H,W,C)
+        return np.argmax(prob, axis=-1).astype(np.int64)
+
+    # 便利関数: 指定 time の Stage1.5/Stage2.5 を読み warm/cold/junction を取得（なければゼロ）
+    def _load_fixed_layers(t_dt_local: pd.Timestamp):
+        jmask = np.zeros((h, w), dtype=np.uint8)
+        warm = np.zeros((h, w), dtype=np.uint8)
+        cold = np.zeros((h, w), dtype=np.uint8)
+        if t_dt_local is None:
+            return warm, cold, jmask
+        token = t_dt_local.strftime("%Y%m%d%H%M")
+        # Stage2.5 warm/cold (+ junction if available)
+        wcpath = os.path.join(stage2_5_out_dir, f"refined_{token}.nc")
+        if os.path.exists(wcpath):
+            with xr.open_dataset(wcpath) as wd:
+                if "class_map" in wd:
+                    cm = wd["class_map"]
+                    arr = cm.isel(time=0).values if "time" in cm.dims else cm.values
+                    arr = np.asarray(arr)
+                    if arr.ndim == 3 and arr.shape[0] == 1:
+                        arr = arr[0]
+                    if arr.ndim != 2:
+                        arr = np.squeeze(arr)
+                    warm = (arr == 1).astype(np.uint8)
+                    cold = (arr == 2).astype(np.uint8)
+                else:
+                    if "warm" in wd and "cold" in wd:
+                        w_arr = wd["warm"]
+                        c_arr = wd["cold"]
+                        w_arr = w_arr.isel(time=0).values if "time" in w_arr.dims else w_arr.values
+                        c_arr = c_arr.isel(time=0).values if "time" in c_arr.dims else c_arr.values
+                        warm = (np.squeeze(w_arr) > 0.5).astype(np.uint8)
+                        cold = (np.squeeze(c_arr) > 0.5).astype(np.uint8)
+                # Prefer Stage2.5 junction if present
+                if "junction" in wd:
+                    jv = wd["junction"]
+                    jarr = jv.isel(time=0).values if "time" in jv.dims else jv.values
+                    jmask = (np.squeeze(jarr) > 0).astype(np.uint8)
+        # Fallback: Stage1.5 junction
+        if jmask.sum() == 0:
+            jpath = os.path.join(stage1_5_out_dir, f"junction_{token}.nc")
+            if os.path.exists(jpath):
+                with xr.open_dataset(jpath) as jd:
+                    if "junction" in jd:
+                        j = jd["junction"]
+                        jarr = j.isel(time=0).values if "time" in j.dims else j.values
+                        jmask = (np.squeeze(jarr) > 0).astype(np.uint8)
+                    elif "class_map" in jd:
+                        jmask = (jd["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+        return warm, cold, jmask
+
+    try:
+        if stage_name == "stage1":
+            cls = _prob_argmax(ds["probabilities"])
+            pred = np.where(cls == 1, 5, 0)
+        elif stage_name == "stage1_5":
+            if "junction" in ds:
+                j = ds["junction"]
+                jmask = (j.isel(time=0).values if "time" in j.dims else j.values).astype(np.uint8)
+            elif "class_map" in ds:
+                jmask = (ds["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+            else:
+                var = list(ds.data_vars)[0]
+                v = ds[var]
+                jmask = (v.isel(time=0).values if "time" in v.dims else v.values)
+                jmask = (jmask > 0.5).astype(np.uint8)
+            pred = np.where(jmask == 1, 5, 0)
+        elif stage_name == "stage2":
+            # 確定: junction(5) + warm(1)/cold(2)
+            cls = _prob_argmax(ds["probabilities"])
+            warm = (cls == 1).astype(np.uint8)
+            cold = (cls == 2).astype(np.uint8)
+            # junction は Stage2.5 を優先（なければ Stage1.5 にフォールバック）
+            wfix, cfix, jmask = _load_fixed_layers(t_dt)
+            # 表示は確定順で重畳（上書き禁止）
+            pred = np.zeros((h, w), dtype=np.int64)
+            pred[jmask == 1] = 5
+            mask = (pred == 0) & (warm == 1)
+            pred[mask] = 1
+            mask = (pred == 0) & (cold == 1)
+            pred[mask] = 2
+        elif stage_name == "stage2_5":
+            # class_map: 0/1/2 + junction 変数が同梱
+            cm = ds["class_map"].values.astype(np.int64)
+            warm = (cm == 1).astype(np.uint8)
+            cold = (cm == 2).astype(np.uint8)
+            if "junction" in ds:
+                j = ds["junction"]
+                jmask = (j.isel(time=0).values if "time" in j.dims else j.values).astype(np.uint8)
+            else:
+                # 念のため Stage1.5 から読む
+                _, _, jmask = _load_fixed_layers(t_dt)
+            pred = np.zeros((h, w), dtype=np.int64)
+            pred[jmask == 1] = 5
+            mask = (pred == 0) & (warm == 1)
+            pred[mask] = 1
+            mask = (pred == 0) & (cold == 1)
+            pred[mask] = 2
+        elif stage_name == "stage3":
+            # occluded 予測 + 既確定の junction/warm/cold を重畳
+            cls = _prob_argmax(ds["probabilities"])
+            occ = (cls == 1).astype(np.uint8)
+            warm, cold, jmask = _load_fixed_layers(t_dt)
+            pred = np.zeros((h, w), dtype=np.int64)
+            pred[jmask == 1] = 5
+            mask = (pred == 0) & (warm == 1)
+            pred[mask] = 1
+            mask = (pred == 0) & (cold == 1)
+            pred[mask] = 2
+            mask = (pred == 0) & (occ == 1)
+            pred[mask] = 4
+        elif stage_name == "stage3_5":
+            cm = ds["class_map"].values.astype(np.int64)  # 0/1 occluded
+            occ = (cm > 0).astype(np.uint8)
+            warm, cold, jmask = _load_fixed_layers(t_dt)
+            pred = np.zeros((h, w), dtype=np.int64)
+            pred[jmask == 1] = 5
+            mask = (pred == 0) & (warm == 1)
+            pred[mask] = 1
+            mask = (pred == 0) & (cold == 1)
+            pred[mask] = 2
+            mask = (pred == 0) & (occ == 1)
+            pred[mask] = 4
+        elif stage_name == "stage4":
+            # stationary 予測 + 既確定の junction/warm/cold + 可能なら stage3_5 occluded を重畳
+            cls = _prob_argmax(ds["probabilities"])
+            sta = (cls == 1).astype(np.uint8)
+            warm, cold, jmask = _load_fixed_layers(t_dt)
+            # occluded は可能なら stage3_5 から
+            occ = np.zeros((h, w), dtype=np.uint8)
+            if t_dt is not None:
+                ocp = os.path.join(stage3_5_out_dir, f"occluded_{t_dt.strftime('%Y%m%d%H%M')}.nc")
+                if os.path.exists(ocp):
+                    with xr.open_dataset(ocp) as od:
+                        if "class_map" in od:
+                            occ = (od["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+            pred = np.zeros((h, w), dtype=np.int64)
+            pred[jmask == 1] = 5
+            mask = (pred == 0) & (warm == 1)
+            pred[mask] = 1
+            mask = (pred == 0) & (cold == 1)
+            pred[mask] = 2
+            mask = (pred == 0) & (occ == 1)
+            pred[mask] = 4
+            mask = (pred == 0) & (sta == 1)
+            pred[mask] = 3
+        elif stage_name == "stage4_5":
+            cm = ds["class_map"].values.astype(np.int64)  # 最終合成（0..5）
+            pred = cm
+        else:
+            pred = np.zeros((h, w), dtype=np.int64)
+    finally:
+        ds.close()
+
+    return pred, lat, lon, t_dt
+
+
+def _stage_dirs(stage_name: str):
+    """
+    関数概要:
+      可視化対象ステージ名に応じて、入力ディレクトリ・ファイル接頭辞・出力ディレクトリ名（タグ）を決定する。
+
+    入力:
+      - stage_name (str): "stage1","stage1_5","stage2","stage2_5","stage3","stage3_5","stage4","stage4_5" のいずれか
+
+    処理:
+      - 各ステージの成果物の保存先（*_out_dir）と、ファイル名接頭辞（prob_/junction_/refined_/occluded_/final_）を返す
+      - "stage4_5" は最終成果物として final_out_dir/final_*.nc を対象に表示
+
+    出力:
+      - Tuple[str, str, str]: (入力ディレクトリ, ファイル接頭辞, 出力タグ名)
+    """
+    if stage_name == "stage1":
+        return stage1_out_dir, "prob_", "stage1"
+    if stage_name == "stage1_5":
+        return stage1_5_out_dir, "junction_", "stage1_5"
+    if stage_name == "stage2":
+        return stage2_out_dir, "prob_", "stage2"
+    if stage_name == "stage2_5":
+        return stage2_5_out_dir, "refined_", "stage2_5"
+    if stage_name == "stage3":
+        return stage3_out_dir, "prob_", "stage3"
+    if stage_name == "stage3_5":
+        return stage3_5_out_dir, "occluded_", "stage3_5"
+    if stage_name == "stage4":
+        return stage4_out_dir, "prob_", "stage4"
+    if stage_name == "stage4_5":
+        # 最終成果物は final_out_dir/final_*.nc を主対象に表示
+        return final_out_dir, "final_", "stage4_5"
+    raise ValueError(f"Unknown stage_name: {stage_name}")
+
+
+def _draw_and_save(stage_name: str, time_str: str, pred_cm: np.ndarray, lat: np.ndarray, lon: np.ndarray,
+                   out_dir_stage: str):
+    """
+    Pred vs GT の 2 パネルを保存。背景に気圧偏差、低気圧中心（任意）を重畳。
+    """
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+
+    gt_cm = _gt_class_map_for_time(pd.to_datetime(time_str, format="%Y%m%d%H%M"), lat, lon)
+
+    # 背景（pressure deviation, low centers）
+    month_str = time_str[:6]
+    pdev, low_mask, low_exists = _load_pressure_and_lowcenter(month_str, pd.to_datetime(time_str, format="%Y%m%d%H%M"))
+
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+
+    class_colors = CFG["VISUALIZATION"]["class_colors"]
+    cmap = mcolors.ListedColormap([class_colors[i] for i in sorted(class_colors.keys())])
+    bounds = np.arange(len(class_colors) + 1) - 0.5
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+    pressure_vmin = CFG["VISUALIZATION"]["pressure_vmin"]
+    pressure_vmax = CFG["VISUALIZATION"]["pressure_vmax"]
+    pressure_levels = np.linspace(pressure_vmin, pressure_vmax, CFG["VISUALIZATION"]["pressure_levels"])
+    pressure_norm = mcolors.Normalize(vmin=pressure_vmin, vmax=pressure_vmax)
+    cmap_pressure = plt.get_cmap("RdBu_r")
+
+    fig = plt.figure(figsize=(16, 6))
+    from matplotlib import gridspec
+    gs = gridspec.GridSpec(1, 3, width_ratios=[1, 1, 0.05], wspace=0.1)
+
+    ax0 = plt.subplot(gs[0], projection=ccrs.PlateCarree())
+    ax1 = plt.subplot(gs[1], projection=ccrs.PlateCarree())
+    cax = plt.subplot(gs[2])
+
+    extent = [lon.min(), lon.max(), lat.min(), lat.max()]
+    for ax in [ax0, ax1]:
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="black")
+        ax.add_feature(cfeature.BORDERS.with_scale("10m"), linestyle=":")
+        ax.add_feature(cfeature.LAKES.with_scale("10m"), alpha=0.5)
+        ax.add_feature(cfeature.RIVERS.with_scale("10m"))
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color="gray", linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+        ax.tick_params(labelsize=8)
+
+        if pdev is not None:
+            ax.contourf(
+                lon_grid, lat_grid, pdev,
+                levels=pressure_levels, cmap=cmap_pressure, extend="both",
+                norm=pressure_norm, transform=ccrs.PlateCarree(), zorder=0
+            )
+            ax.contour(
+                lon_grid, lat_grid, pdev,
+                levels=pressure_levels, colors="black", linestyles="--", linewidths=1.0,
+                transform=ccrs.PlateCarree(), zorder=1
+            )
+
+    # Pred
+    ax0.pcolormesh(
+        lon_grid, lat_grid, pred_cm,
+        cmap=cmap, norm=norm, transform=ccrs.PlateCarree(),
+        alpha=0.6, zorder=2
+    )
+    ax0.set_title(f"{stage_name} Pred\n{time_str}")
+
+    # GT
+    ax1.pcolormesh(
+        lon_grid, lat_grid, gt_cm,
+        cmap=cmap, norm=norm, transform=ccrs.PlateCarree(),
+        alpha=0.6, zorder=2
+    )
+    ax1.set_title(f"Ground Truth\n{time_str}")
+
+    # 低気圧中心
+    if pdev is not None and low_exists and (low_mask is not None) and (low_mask.shape == pred_cm.shape):
+        y_idx, x_idx = np.where(low_mask)
+        low_lats = lat[y_idx]
+        low_lons = lon[x_idx]
+        for ax in [ax0, ax1]:
+            ax.plot(low_lons, low_lats, "rx", markersize=6, markeredgewidth=1.5, zorder=6, label="低気圧中心")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap_pressure, norm=pressure_norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, cax=cax, orientation="vertical")
+    cbar.set_label("海面更正気圧の偏差 (hPa)")
+
+    os.makedirs(out_dir_stage, exist_ok=True)
+    out_path = os.path.join(out_dir_stage, f"comparison_{stage_name}_{time_str}.png")
+    plt.savefig(out_path, dpi=250, bbox_inches="tight")
+    plt.close()
+    gc.collect()
+
+
+def run_visualization_for_stage(stage_name: str):
+    """
+    指定ステージの .nc を可視化し PNG を保存。
+    stage_name in {"stage1","stage1_5","stage2","stage2_5","stage3","stage3_5","stage4","stage4_5"}
+    """
+    print_memory_usage(f"Start Visualization for {stage_name}")
+    t0 = time.time()
+
+    in_dir, prefix, stage_tag = _stage_dirs(stage_name)
+    files = _list_nc(in_dir, prefix=prefix)
+    if not files:
+        print(f"[v4-visualize] No files for {stage_name} in: {in_dir}")
+        return
+
+    out_dir_stage = os.path.join(output_visual_dir, stage_tag)
+    for f in files:
+        time_str = f.replace(prefix, "").replace(".nc", "")
+        nc_path = os.path.join(in_dir, f)
+        try:
+            pred_cm, lat, lon, t_dt = _pred_class_map_for_stage(stage_name, nc_path)
+            if t_dt is None:
+                # 可能な限りファイル名から復元
+                t_dt = pd.to_datetime(time_str, format="%Y%m%d%H%M")
+            _draw_and_save(stage_tag, t_dt.strftime("%Y%m%d%H%M"), pred_cm, lat, lon, out_dir_stage)
+        except Exception as e:
+            print(f"[v4-visualize] Failed to visualize {stage_name} {f}: {e}")
+            continue
+
+    print_memory_usage(f"After Visualization for {stage_name}")
+    print(f"[v4-visualize] {stage_name} done in {format_time(time.time() - t0)}")
+
+
+__all__ = ["run_visualization_for_stage"]
