@@ -28,6 +28,8 @@ notify-run gpu02 -- nohup python main_v3.py > output_v3.log 2>&1 &
 
 ```bash
 pkill -f "main_v3.py"
+
+pkill -f "main_v4.py"
 ```
 
 権利を takumi ユーザーに指定
