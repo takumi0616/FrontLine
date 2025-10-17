@@ -153,65 +153,95 @@ def _load_stage4_stationary_prob(nc_path: str):
 def _load_stage3_5_occluded(nc_path: str):
     """
     関数概要:
-      Stage3.5 の occluded 出力（occluded_*.nc）を読み、0/1 の閉塞マスクを返す。
+      Stage3.5 の occluded 出力（occluded_*.nc）を読み、0/1 の閉塞マスクを返す（常に2次元に正規化）。
 
     入力:
       - nc_path (str): occluded_*.nc のパス
-
-    処理:
-      - "class_map" があれば >0 を 1 として 0/1 化
-      - 代替として "occluded" 変数があれば 0.5 閾値で 0/1 化
-      - どちらもなければゼロ配列（サイズは lat/lon 次元から決定）
 
     出力:
       - np.ndarray: (H,W) uint8 の 0/1 マスク
     """
     import xarray as xr
     ds = xr.open_dataset(nc_path)
-    if "class_map" in ds:
-        occ = (ds["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
-    else:
-        # fallback: try a variable named "occluded"
-        if "occluded" in ds:
-            occ = (ds["occluded"].values > 0.5).astype(np.uint8)
+    try:
+        if "class_map" in ds:
+            v = ds["class_map"]
+            arr = v.isel(time=0).values if "time" in v.dims else v.values
+            arr = np.squeeze(np.asarray(arr))
+            if arr.ndim != 2:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                occ = np.zeros((h, w), dtype=np.uint8)
+            else:
+                occ = (arr > 0).astype(np.uint8)
+        elif "occluded" in ds:
+            v = ds["occluded"]
+            arr = v.isel(time=0).values if "time" in v.dims else v.values
+            arr = np.squeeze(np.asarray(arr))
+            if arr.ndim != 2:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                occ = np.zeros((h, w), dtype=np.uint8)
+            else:
+                occ = (arr > 0.5).astype(np.uint8)
         else:
-            h = ds.dims.get("lat", 0); w = ds.dims.get("lon", 0)
+            h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
             occ = np.zeros((h, w), dtype=np.uint8)
-    ds.close()
-    return occ
+        return occ
+    finally:
+        ds.close()
 
 def _load_stage2_5_warm_cold(nc_path: str):
     """
     関数概要:
-      Stage2.5 refined 出力から warm/cold の 0/1 マスクを読み出す。
+      Stage2.5 refined 出力から warm/cold の 0/1 マスクを読み出す（常に2次元に正規化）。
 
     入力:
       - nc_path (str): refined_*.nc のパス
-
-    処理:
-      - "class_map" があれば ==1 を warm, ==2 を cold として 0/1 化
-      - 代替として "warm"/"cold" 変数があれば 0.5 閾値で 0/1 化
-      - どれも無い場合はゼロ配列でフォールバック
 
     出力:
       - Tuple[np.ndarray, np.ndarray]: (warm(H,W) uint8, cold(H,W) uint8)
     """
     import xarray as xr
     ds = xr.open_dataset(nc_path)
-    if "class_map" in ds:
-        cm = ds["class_map"].values.astype(np.int64)
-        warm = (cm == 1).astype(np.uint8)
-        cold = (cm == 2).astype(np.uint8)
-    else:
-        if "warm" in ds and "cold" in ds:
-            warm = (ds["warm"].values > 0.5).astype(np.uint8)
-            cold = (ds["cold"].values > 0.5).astype(np.uint8)
+    try:
+        if "class_map" in ds:
+            v = ds["class_map"]
+            arr = v.isel(time=0).values if "time" in v.dims else v.values
+            arr = np.squeeze(np.asarray(arr))
+            # ensure 2D
+            if arr.ndim != 2:
+                h = int(ds.sizes.get("lat", arr.shape[-2] if arr.ndim >= 2 else 0))
+                w = int(ds.sizes.get("lon", arr.shape[-1] if arr.ndim >= 2 else 0))
+                tmp = np.zeros((h, w), dtype=arr.dtype)
+                try:
+                    hh = min(h, arr.shape[-2]); ww = min(w, arr.shape[-1])
+                    tmp[:hh, :ww] = arr[..., :hh, :ww]
+                except Exception:
+                    pass
+                arr = tmp
+            warm = (arr == 1).astype(np.uint8)
+            cold = (arr == 2).astype(np.uint8)
         else:
-            h = ds.dims.get("lat", 0); w = ds.dims.get("lon", 0)
-            warm = np.zeros((h, w), dtype=np.uint8)
-            cold = np.zeros((h, w), dtype=np.uint8)
-    ds.close()
-    return warm, cold
+            wv = ds["warm"] if "warm" in ds else None
+            cv = ds["cold"] if "cold" in ds else None
+            if wv is not None and cv is not None:
+                w_arr = wv.isel(time=0).values if "time" in wv.dims else wv.values
+                c_arr = cv.isel(time=0).values if "time" in cv.dims else cv.values
+                w_arr = np.squeeze(np.asarray(w_arr))
+                c_arr = np.squeeze(np.asarray(c_arr))
+                if w_arr.ndim != 2 or c_arr.ndim != 2:
+                    h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                    warm = np.zeros((h, w), dtype=np.uint8)
+                    cold = np.zeros((h, w), dtype=np.uint8)
+                else:
+                    warm = (w_arr > 0.5).astype(np.uint8)
+                    cold = (c_arr > 0.5).astype(np.uint8)
+            else:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                warm = np.zeros((h, w), dtype=np.uint8)
+                cold = np.zeros((h, w), dtype=np.uint8)
+        return warm, cold
+    finally:
+        ds.close()
 
 def _load_stage1_5_junction(nc_path: str):
     """

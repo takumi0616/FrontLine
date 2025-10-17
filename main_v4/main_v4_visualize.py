@@ -376,14 +376,24 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
             cls = _prob_argmax(ds["probabilities"])
             sta = (cls == 1).astype(np.uint8)
             warm, cold, jmask = _load_fixed_layers(t_dt)
-            # occluded は可能なら stage3_5 から
+            # occluded は可能なら stage3_5 から（time 次元を落として2次元に正規化）
             occ = np.zeros((h, w), dtype=np.uint8)
             if t_dt is not None:
                 ocp = os.path.join(stage3_5_out_dir, f"occluded_{t_dt.strftime('%Y%m%d%H%M')}.nc")
                 if os.path.exists(ocp):
                     with xr.open_dataset(ocp) as od:
                         if "class_map" in od:
-                            occ = (od["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+                            v = od["class_map"]
+                            arr = v.isel(time=0).values if "time" in v.dims else v.values
+                            arr = np.squeeze(np.asarray(arr))
+                            if arr.ndim == 2:
+                                occ = (arr > 0).astype(np.uint8)
+                        elif "occluded" in od:
+                            v = od["occluded"]
+                            arr = v.isel(time=0).values if "time" in v.dims else v.values
+                            arr = np.squeeze(np.asarray(arr))
+                            if arr.ndim == 2:
+                                occ = (arr > 0.5).astype(np.uint8)
             pred = np.zeros((h, w), dtype=np.int64)
             pred[jmask == 1] = 5
             mask = (pred == 0) & (warm == 1)
