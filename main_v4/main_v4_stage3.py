@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 
 from .main_v4_config import (
     CFG, device, print_memory_usage, format_time,
-    model_s3_save_dir, stage3_out_dir,
+    model_s3_save_dir, stage3_out_dir, atomic_save_netcdf,
 )
 from .main_v4_datasets import (
     get_available_months,
@@ -197,7 +197,13 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
                     t_dt = pd.to_datetime(str(tstr))
                 ds["time"] = [t_dt]
                 out_name = os.path.join(save_dir, f"prob_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-                ds.to_netcdf(out_name, engine="netcdf4")
+                # 出力済みスキップ + アトミック書き込み（リトライ付き）
+                if os.path.exists(out_name):
+                    print(f"[V4-Stage3] Skip existing output: {os.path.basename(out_name)}")
+                else:
+                    ok = atomic_save_netcdf(ds, out_name, engine="netcdf4", retries=3, sleep_sec=0.5)
+                    if not ok:
+                        print(f"[V4-Stage3] Failed to save: {out_name}")
                 del ds, da
             del prob, logits, prob_np
             gc.collect()

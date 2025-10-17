@@ -330,13 +330,21 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
             mask = (pred == 0) & (cold == 1)
             pred[mask] = 2
         elif stage_name == "stage2_5":
-            # class_map: 0/1/2 + junction 変数が同梱
-            cm = ds["class_map"].values.astype(np.int64)
+            # class_map: 0/1/2 + junction 変数が同梱（必ず2Dに正規化）
+            v = ds["class_map"]
+            arr = v.isel(time=0).values if "time" in v.dims else v.values
+            arr = np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim != 2:
+                arr = np.squeeze(arr)
+            cm = arr.astype(np.int64)
             warm = (cm == 1).astype(np.uint8)
             cold = (cm == 2).astype(np.uint8)
             if "junction" in ds:
                 j = ds["junction"]
-                jmask = (j.isel(time=0).values if "time" in j.dims else j.values).astype(np.uint8)
+                jarr = j.isel(time=0).values if "time" in j.dims else j.values
+                jmask = (np.squeeze(np.asarray(jarr)) > 0).astype(np.uint8)
             else:
                 # 念のため Stage1.5 から読む
                 _, _, jmask = _load_fixed_layers(t_dt)
@@ -360,8 +368,21 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
             mask = (pred == 0) & (occ == 1)
             pred[mask] = 4
         elif stage_name == "stage3_5":
-            cm = ds["class_map"].values.astype(np.int64)  # 0/1 occluded
-            occ = (cm > 0).astype(np.uint8)
+            # class_map（閉塞0/1）を2Dに正規化
+            v = ds["class_map"] if "class_map" in ds else None
+            if v is not None:
+                arr = v.isel(time=0).values if "time" in v.dims else v.values
+            else:
+                # フォールバック（通常到達しない想定）
+                var = list(ds.data_vars)[0]
+                vv = ds[var]
+                arr = vv.isel(time=0).values if "time" in vv.dims else vv.values
+            arr = np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim != 2:
+                arr = np.squeeze(arr)
+            occ = (arr > 0).astype(np.uint8)
             warm, cold, jmask = _load_fixed_layers(t_dt)
             pred = np.zeros((h, w), dtype=np.int64)
             pred[jmask == 1] = 5
@@ -405,8 +426,15 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
             mask = (pred == 0) & (sta == 1)
             pred[mask] = 3
         elif stage_name == "stage4_5":
-            cm = ds["class_map"].values.astype(np.int64)  # 最終合成（0..5）
-            pred = cm
+            # 最終合成（0..5）を2Dに正規化
+            v = ds["class_map"]
+            arr = v.isel(time=0).values if "time" in v.dims else v.values
+            arr = np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim != 2:
+                arr = np.squeeze(arr)
+            pred = arr.astype(np.int64)
         else:
             pred = np.zeros((h, w), dtype=np.int64)
     finally:

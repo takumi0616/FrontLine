@@ -28,6 +28,7 @@ import torch
 import numpy as np
 from pathlib import Path
 import torch.nn as nn
+import time
 
 # Ensure local imports (e.g. swin_unet) work when running from repo root
 sys.path.append(str(Path(__file__).parent.resolve()))
@@ -332,6 +333,45 @@ else:
 print(f"Random seed set as {seed}")
 print("Using device:", device)
 
+# Safe atomic NetCDF write with retries
+def atomic_save_netcdf(ds, out_path: str, engine: str = "netcdf4", retries: int = 3, sleep_sec: float = 0.5) -> bool:
+    """
+    原子的なNetCDF保存を行うヘルパー。tmpファイルに書いてからリネームすることで途中中断による破損を防止。
+    失敗時は一定回数リトライする。
+    戻り値: True=成功, False=失敗
+    """
+    import os as _os
+    import traceback as _tb
+
+    tmp_path = out_path + ".tmp"
+    for i in range(max(1, int(retries))):
+        try:
+            # 既存tmpを消す
+            if _os.path.exists(tmp_path):
+                try:
+                    _os.remove(tmp_path)
+                except Exception:
+                    pass
+            # 書き込み
+            ds.to_netcdf(tmp_path, engine=engine)
+            # アトミック置換
+            _os.replace(tmp_path, out_path)
+            return True
+        except Exception as e:
+            print(f"[atomic_save_netcdf] attempt {i+1}/{retries} failed: {e}")
+            print(_tb.format_exc())
+            try:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+            except Exception:
+                pass
+            try:
+                time.sleep(sleep_sec)
+            except Exception:
+                pass
+    print(f"[atomic_save_netcdf] giving up after {retries} attempts: {out_path}")
+    return False
+
 __all__ = [
     "CFG", "device", "ORIG_H", "ORIG_W",
     "nc_gsm_dir", "nc_0p5_dir",
@@ -342,5 +382,5 @@ __all__ = [
     "final_out_dir",
     "model_s1_save_dir", "model_s2_save_dir", "model_s3_save_dir", "model_s4_save_dir",
     "output_visual_dir",
-    "print_memory_usage", "format_time",
+    "print_memory_usage", "format_time", "atomic_save_netcdf",
 ]

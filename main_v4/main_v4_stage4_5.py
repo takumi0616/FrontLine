@@ -33,6 +33,7 @@ from .main_v4_config import (
     CFG, print_memory_usage, format_time,
     stage1_5_out_dir, stage2_5_out_dir, stage3_5_out_dir, stage4_out_dir,
     stage4_5_out_dir, final_out_dir,
+    atomic_save_netcdf,
 )
 # 可視化ユーティリティ:
 # 本ステージ単体で実行した場合でも、整形出力（final_*.nc）を可視化PNGとして保存するために使用。
@@ -377,22 +378,35 @@ def process_one_time(s4_prob_path: str, s3_5_path: str, s2_5_path: str, s1_5_pat
     # アセンブル（優先度適用）
     final = _assemble_final(warm, cold_aug, st_ref, occ, junc)
 
-    # 保存: stationary refined
+    # 出力パス（先に作ってスキップ判定）
+    out_s = os.path.join(stage4_5_out_dir, f"stationary_{t_dt.strftime('%Y%m%d%H%M')}.nc")
+    out_f = os.path.join(final_out_dir,  f"final_{t_dt.strftime('%Y%m%d%H%M')}.nc")
+
+    # 出力済みスキップ（両方揃っていればスキップ）
+    if os.path.exists(out_s) and os.path.exists(out_f):
+        print(f"[V4-Stage4.5] Skip existing outputs: {os.path.basename(out_s)}, {os.path.basename(out_f)}")
+        return
+
+    # 保存: stationary refined（アトミック・リトライ）
     os.makedirs(stage4_5_out_dir, exist_ok=True)
     da_s = xr.DataArray(st_ref.astype(np.int64), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
     ds_s = xr.Dataset({"class_map": da_s}).expand_dims("time")
     ds_s["time"] = [t_dt]
-    out_s = os.path.join(stage4_5_out_dir, f"stationary_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-    ds_s.to_netcdf(out_s, engine="netcdf4")
+    if not os.path.exists(out_s):
+        ok = atomic_save_netcdf(ds_s, out_s, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok:
+            print(f"[V4-Stage4.5] Failed to save (stationary): {out_s}")
     del ds_s, da_s
 
-    # 保存: final class map
+    # 保存: final class map（アトミック・リトライ）
     os.makedirs(final_out_dir, exist_ok=True)
     da_f = xr.DataArray(final.astype(np.int64), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
     ds_f = xr.Dataset({"class_map": da_f}).expand_dims("time")
     ds_f["time"] = [t_dt]
-    out_f = os.path.join(final_out_dir, f"final_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-    ds_f.to_netcdf(out_f, engine="netcdf4")
+    if not os.path.exists(out_f):
+        ok = atomic_save_netcdf(ds_f, out_f, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok:
+            print(f"[V4-Stage4.5] Failed to save (final): {out_f}")
     del ds_f, da_f
 
     gc.collect()

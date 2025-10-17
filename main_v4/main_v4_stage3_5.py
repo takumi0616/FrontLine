@@ -26,6 +26,7 @@ import pandas as pd
 from .main_v4_config import (
     CFG, print_memory_usage, format_time,
     stage2_5_out_dir, stage3_out_dir, stage3_5_out_dir,
+    atomic_save_netcdf,
 )
 # 可視化ユーティリティ:
 # 本ステージ単体で実行した場合でも、整形出力（occluded_*.nc）を可視化PNGとして保存するために使用。
@@ -166,12 +167,19 @@ def process_one_time(s3_prob_path: str, s2_5_path: str, s1_5_path: str, out_dir:
     occ_ref = _filter_occluded_by_attachment(occ, warm, cold, junc, connectivity=connectivity)
 
     os.makedirs(out_dir, exist_ok=True)
-    da = xr.DataArray(occ_ref.astype(np.int64), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
-    ds = xr.Dataset({"class_map": da}).expand_dims("time")
-    ds["time"] = [t_dt]
     out = os.path.join(out_dir, f"occluded_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-    ds.to_netcdf(out, engine="netcdf4")
-    del ds, da, occ_ref, occ, warm, cold, junc
+    # 出力済みスキップ
+    if os.path.exists(out):
+        print(f"[V4-Stage3.5] Skip existing output: {os.path.basename(out)}")
+    else:
+        da = xr.DataArray(occ_ref.astype(np.int64), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        ds = xr.Dataset({"class_map": da}).expand_dims("time")
+        ds["time"] = [t_dt]
+        ok = atomic_save_netcdf(ds, out, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok:
+            print(f"[V4-Stage3.5] Failed to save: {out}")
+        del ds, da
+    del occ_ref, occ, warm, cold, junc
     gc.collect()
 
 def run_stage3_5():

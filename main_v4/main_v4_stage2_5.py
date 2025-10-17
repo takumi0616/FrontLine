@@ -28,6 +28,7 @@ import pandas as pd
 from .main_v4_config import (
     CFG, print_memory_usage, format_time,
     stage1_5_out_dir, stage2_out_dir, stage2_5_out_dir,
+    atomic_save_netcdf,
 )
 # 可視化ユーティリティ:
 # 本ステージ単体で実行した場合でも、整形出力（refined_*.nc）を可視化PNGとして保存するために使用。
@@ -252,21 +253,27 @@ def process_one_time(s2_path: str, junc_path: str, out_dir: str, connectivity: i
 
     # 保存（class_map と junction を同一ファイルに格納）
     os.makedirs(out_dir, exist_ok=True)
-    da_cls = xr.DataArray(
-        refined.astype(np.int64),
-        dims=["lat", "lon"],
-        coords={"lat": lat, "lon": lon}
-    )
-    da_junc = xr.DataArray(
-        junc_filtered.astype(np.uint8),
-        dims=["lat", "lon"],
-        coords={"lat": lat, "lon": lon}
-    )
-    ds = xr.Dataset({"class_map": da_cls, "junction": da_junc}).expand_dims("time")
-    ds["time"] = [t_dt]
     out = os.path.join(out_dir, f"refined_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-    ds.to_netcdf(out, engine="netcdf4")
-    del ds, da_cls, da_junc, refined, junc_filtered, cls_map, junc
+    if os.path.exists(out):
+        print(f"[V4-Stage2.5] Skip existing output: {os.path.basename(out)}")
+    else:
+        da_cls = xr.DataArray(
+            refined.astype(np.int64),
+            dims=["lat", "lon"],
+            coords={"lat": lat, "lon": lon}
+        )
+        da_junc = xr.DataArray(
+            junc_filtered.astype(np.uint8),
+            dims=["lat", "lon"],
+            coords={"lat": lat, "lon": lon}
+        )
+        ds = xr.Dataset({"class_map": da_cls, "junction": da_junc}).expand_dims("time")
+        ds["time"] = [t_dt]
+        ok = atomic_save_netcdf(ds, out, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok:
+            print(f"[V4-Stage2.5] Failed to save: {out}")
+        del ds, da_cls, da_junc
+    del refined, junc_filtered, cls_map, junc
     gc.collect()
 
 def run_stage2_5():

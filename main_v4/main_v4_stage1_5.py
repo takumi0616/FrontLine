@@ -23,7 +23,7 @@ import pandas as pd
 
 from .main_v4_config import (
     CFG, ORIG_H, ORIG_W, print_memory_usage, format_time,
-    stage1_out_dir, stage1_5_out_dir,
+    stage1_out_dir, stage1_5_out_dir, atomic_save_netcdf,
 )
 # 可視化ユーティリティ:
 # 各ステージ完了後に、そのステージの成果物を PNG で出力するための関数。
@@ -154,18 +154,24 @@ def process_one_file(prob_path: str,
         connectivity=connectivity
     )
 
-    # 保存
+    # 保存（出力済みスキップ + アトミック書き込み）
     os.makedirs(stage1_5_out_dir, exist_ok=True)
-    da = xr.DataArray(
-        jmask_ref.astype(np.uint8),
-        dims=["lat", "lon"],
-        coords={"lat": lat[:ORIG_H], "lon": lon[:ORIG_W]}
-    )
-    ds = xr.Dataset({"junction": da}).expand_dims("time")
-    ds["time"] = [t_dt]
     out = os.path.join(stage1_5_out_dir, f"junction_{t_dt.strftime('%Y%m%d%H%M')}.nc")
-    ds.to_netcdf(out, engine="netcdf4")
-    del ds, da, probs, jmask, jmask_ref
+    if os.path.exists(out):
+        print(f"[V4-Stage1.5] Skip existing output: {os.path.basename(out)}")
+    else:
+        da = xr.DataArray(
+            jmask_ref.astype(np.uint8),
+            dims=["lat", "lon"],
+            coords={"lat": lat[:ORIG_H], "lon": lon[:ORIG_W]}
+        )
+        ds = xr.Dataset({"junction": da}).expand_dims("time")
+        ds["time"] = [t_dt]
+        ok = atomic_save_netcdf(ds, out, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok:
+            print(f"[V4-Stage1.5] Failed to save: {out}")
+        del ds, da
+    del probs, jmask, jmask_ref
     gc.collect()
 
 def run_stage1_5():
