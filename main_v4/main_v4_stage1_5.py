@@ -1,9 +1,9 @@
 """
 概要:
     Stage1.5（接合=5 の論理整形）
-    - 入力: Stage1 の確率出力 (C=2: none/junction)
+    - 入力: Stage1 の確率出力 (C=6: none/warm/cold/stationary/occluded/junction)
     - 処理:
-        1) junction 二値化（argmax==1 を基本。必要なら確率閾値で強化可能）
+        1) junction 二値化（argmax==5 を基本。必要なら確率閾値で強化可能）
         2) 連結成分ごとに面積評価
            - 面積 < min_keep_area → 削除（散在する1画素ノイズ除去）
            - 面積 > max_area_to_shrink → 成分の重心付近を 2x2 の塊に縮退
@@ -49,7 +49,7 @@ def _load_probs_2(path: str):
     入力:
       - path (str): prob_*.nc のフルパス
     処理:
-      - ds["probabilities"].isel(time=0) で (H,W,C=2) を取得（time 次元がある前提）
+      - ds["probabilities"].isel(time=0) で (H,W,C=6) を取得（time 次元がある前提）
       - lat/lon 座標と time[0] をあわせて取得
     出力:
       - Tuple[np.ndarray, np.ndarray, np.ndarray, pd.Timestamp]:
@@ -125,7 +125,7 @@ def process_one_file(prob_path: str,
                      connectivity: int):
     """
     関数概要:
-      1 つの Stage1 確率出力（prob_*.nc）から junction(=class1) を argmax で二値化し、
+      1 つの Stage1 確率出力（prob_*.nc）から junction(=class5) を argmax で二値化し、
       連結成分の面積ルール（小領域削除・過大領域の 2x2 縮退）で整形したマスクを NetCDF（junction_*.nc）として保存する。
     入力:
       - prob_path (str): prob_*.nc のフルパス
@@ -142,9 +142,9 @@ def process_one_file(prob_path: str,
     """
     import xarray as xr
     probs, lat, lon, t_dt = _load_probs_2(prob_path)
-    # argmax で junction (class=1)
+    # argmax で junction (class=5)
     cls = np.argmax(probs, axis=-1).astype(np.int64)  # (H,W)
-    jmask = (cls == 1).astype(np.uint8)
+    jmask = (cls == 5).astype(np.uint8)
 
     # 整形
     jmask_ref = _refine_junction_mask(

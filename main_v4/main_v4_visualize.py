@@ -199,6 +199,61 @@ def _load_pressure_and_lowcenter(month_str: str, time_dt: pd.Timestamp):
     pressure_dev = prmsl - area_mean
     return pressure_dev, low_mask, low_center_exists
 
+def _get_gsm_lat_lon(time_dt: pd.Timestamp):
+    """
+    GSM の当該月ファイルから (lat, lon) の 1D 座標を取得する（可視化用の堅牢化フォールバック）。
+    見つからない/読み込めない場合は (None, None) を返す。
+    """
+    try:
+        month_str = time_dt.strftime("%Y%m")
+        gsm_file = os.path.join(nc_gsm_dir, f"gsm{month_str}.nc")
+        if not os.path.exists(gsm_file):
+            return None, None
+        ds = xr.open_dataset(gsm_file)
+        lat = np.asarray(ds["lat"].values) if "lat" in ds else None
+        lon = np.asarray(ds["lon"].values) if "lon" in ds else None
+        ds.close()
+        return lat, lon
+    except Exception:
+        return None, None
+
+
+def _normalize_lat_lon(lat: np.ndarray, lon: np.ndarray, H: int, W: int, time_dt: pd.Timestamp):
+    """
+    予測配列 pred_cm の形状 (H, W) を正とし、lat/lon を 1D で長さ (H,)/(W,) に正規化する。
+    - まず与えられた lat/lon を使用（1D かつ長さ一致なら採用）
+    - 一致しない場合は GSM 側の座標から取得し、必要に応じて [:H], [:W] でトリム
+    - それでもダメなら単調増加の擬似座標を生成（0..H-1, 0..W-1）
+    """
+    def _is_ok(a, n):
+        try:
+            a = np.asarray(a)
+            return (a.ndim == 1) and (len(a) == n)
+        except Exception:
+            return False
+
+    lat_ok = _is_ok(lat, H)
+    lon_ok = _is_ok(lon, W)
+
+    if lat_ok and lon_ok:
+        return np.asarray(lat), np.asarray(lon)
+
+    # GSM からフォールバック
+    glat, glon = _get_gsm_lat_lon(time_dt)
+    if _is_ok(glat, H) and _is_ok(glon, W):
+        return np.asarray(glat), np.asarray(glon)
+    if glat is not None and glon is not None:
+        # 長さが違う場合は最小限の切り詰め
+        glat = np.asarray(glat)
+        glon = np.asarray(glon)
+        lat2 = glat[:H] if glat.ndim == 1 else np.squeeze(glat)[:H]
+        lon2 = glon[:W] if glon.ndim == 1 else np.squeeze(glon)[:W]
+        if _is_ok(lat2, H) and _is_ok(lon2, W):
+            return np.asarray(lat2), np.asarray(lon2)
+
+    # 最終フォールバック: インデックス座標
+    return np.linspace(0.0, float(H - 1), H), np.linspace(0.0, float(W - 1), W)
+
 
 def _gt_class_map_for_time(time_dt: pd.Timestamp, lat: np.ndarray, lon: np.ndarray):
     """
@@ -302,7 +357,7 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
     try:
         if stage_name == "stage1":
             cls = _prob_argmax(ds["probabilities"])
-            pred = np.where(cls == 1, 5, 0)
+            pred = np.where(cls == 5, 5, 0)
         elif stage_name == "stage1_5":
             if "junction" in ds:
                 j = ds["junction"]
@@ -440,6 +495,14 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
     finally:
         ds.close()
 
+    # 予測配列の形状に lat/lon を合わせる（final_*.nc の座標が壊れている場合の堅牢化）
+    try:
+        if isinstance(pred, np.ndarray) and (pred.ndim == 2):
+            h_pred, w_pred = pred.shape
+            lat, lon = _normalize_lat_lon(lat, lon, h_pred, w_pred, t_dt if t_dt is not None else pd.to_datetime("1970-01-01"))
+    except Exception:
+        pass
+
     return pred, lat, lon, t_dt
 
 
@@ -492,6 +555,9 @@ def _draw_and_save(stage_name: str, time_str: str, pred_cm: np.ndarray, lat: np.
     month_str = time_str[:6]
     pdev, low_mask, low_exists = _load_pressure_and_lowcenter(month_str, pd.to_datetime(time_str, format="%Y%m%d%H%M"))
 
+    # pred_cm の形状に lat/lon を正規化（座標が壊れている場合の対策）
+    H, W = pred_cm.shape
+    lat, lon = _normalize_lat_lon(lat, lon, H, W, pd.to_datetime(time_str, format="%Y%m%d%H%M"))
     lon_grid, lat_grid = np.meshgrid(lon, lat)
 
     class_colors = CFG["VISUALIZATION"]["class_colors"]
@@ -513,7 +579,14 @@ def _draw_and_save(stage_name: str, time_str: str, pred_cm: np.ndarray, lat: np.
     ax1 = plt.subplot(gs[1], projection=ccrs.PlateCarree())
     cax = plt.subplot(gs[2])
 
-    extent = [lon.min(), lon.max(), lat.min(), lat.max()]
+    # extent がゼロ幅になると Cartopy が特異になるため微小幅を付与
+    lon_min, lon_max = float(np.min(lon)), float(np.max(lon))
+    lat_min, lat_max = float(np.min(lat)), float(np.max(lat))
+    if lon_min == lon_max:
+        lon_max = lon_min + 1e-6
+    if lat_min == lat_max:
+        lat_max = lat_min + 1e-6
+    extent = [lon_min, lon_max, lat_min, lat_max]
     for ax in [ax0, ax1]:
         ax.set_extent(extent, crs=ccrs.PlateCarree())
         ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="black")
@@ -525,7 +598,8 @@ def _draw_and_save(stage_name: str, time_str: str, pred_cm: np.ndarray, lat: np.
         gl.right_labels = False
         ax.tick_params(labelsize=8)
 
-        if pdev is not None:
+        # 背景の形状が予測と一致する場合のみ重畳（不一致なら安全にスキップ）
+        if pdev is not None and isinstance(pdev, np.ndarray) and pdev.shape == pred_cm.shape:
             ax.contourf(
                 lon_grid, lat_grid, pdev,
                 levels=pressure_levels, cmap=cmap_pressure, extend="both",

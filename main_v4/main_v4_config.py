@@ -88,9 +88,9 @@ CFG = {
         "ORIG_W": 128,
     },
 
-    # Stage1: 接合=5 を二値（none/接合）で学習
+    # Stage1: 6クラス（0:none,1:warm,2:cold,3:stationary,4:occluded,5:junction）で学習
     "STAGE1": {
-        "num_classes": 2,           # 0:none, 1:junction(=class5)
+        "num_classes": 6,           # 0:none, 1:warm, 2:cold, 3:stationary, 4:occluded, 5:junction
         "in_chans": 93,             # GSM 31変数×(t-6,t,t+6)
         "epochs": 50,
         "train_months": (2014, 1, 2022, 12),

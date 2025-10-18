@@ -259,14 +259,19 @@ class V4DatasetStage1Train(Dataset):
         ds_gsm = xr.open_dataset(it["gsm_file"])
         ds_front = xr.open_dataset(it["front_file"])
         gsm = _read_gsm_93(ds_gsm, it["t_prev"], it["t"], it["t_next"])
-        arr5 = _gt_to_front_channels(ds_front, it["t"])
+        arr5 = _gt_to_front_channels(ds_front, it["t"])  # [warm, cold, stationary, occluded, warm_cold]
         ds_gsm.close(); ds_front.close()
-        # target: junction only (warm_cold)
-        junc = (arr5[4] == 1).astype(np.int64)  # (H,W) 0/1
-        # clip to ORIG_H/W in case input larger
+        # target: 6-class (0:none,1:warm,2:cold,3:stationary,4:occluded,5:junction)
+        # 優先順位は 5 > 4 > 3 > 2 > 1 > 0（後から上書き）
         gsm = gsm[:, :ORIG_H, :ORIG_W]
-        junc = junc[:ORIG_H, :ORIG_W]
-        return gsm, junc, it["t_dt"]
+        arr5 = arr5[:, :ORIG_H, :ORIG_W]
+        cm = np.zeros((ORIG_H, ORIG_W), dtype=np.int64)
+        cm[arr5[0] == 1] = 1  # warm
+        cm[arr5[1] == 1] = 2  # cold
+        cm[arr5[2] == 1] = 3  # stationary
+        cm[arr5[3] == 1] = 4  # occluded
+        cm[arr5[4] == 1] = 5  # junction (warm_cold)
+        return gsm, cm, it["t_dt"]
 
     def __getitem__(self, idx: int):
         if idx in self.sample_cache:
