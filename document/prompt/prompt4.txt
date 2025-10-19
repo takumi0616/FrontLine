@@ -1,3 +1,25 @@
+以下のプログラムを確認してからタスクを実行してください
+@/src/FrontLine/main_v4.py
+@/src/FrontLine/swin_unet.py
+@/src/FrontLine/main_v4/__init__.py
+@/src/FrontLine/main_v4/main_v4_config.py
+@/src/FrontLine/main_v4/main_v4_datasets.py
+@/src/FrontLine/main_v4/main_v4_models.py
+@/src/FrontLine/main_v4/main_v4_stage1_5.py
+@/src/FrontLine/main_v4/main_v4_stage1.py
+@/src/FrontLine/main_v4/main_v4_stage2_5.py
+@/src/FrontLine/main_v4/main_v4_stage2.py
+@/src/FrontLine/main_v4/main_v4_stage3_5.py
+@/src/FrontLine/main_v4/main_v4_stage3.py
+@/src/FrontLine/main_v4/main_v4_stage4_5.py
+@/src/FrontLine/main_v4/main_v4_stage4.py
+@/src/FrontLine/main_v4/main_v4_visualize.py
+
+私のプログラムが私の想定通りかどうかを、以下の私の説明を聞いてことなっているかをチェックしてみてください
+日本語で解説
+
+---
+
 @/src/FrontLine/main_v3/__init__.py
 @/src/FrontLine/main_v3/main_v3_config.py
 @/src/FrontLine/main_v3/main_v3_datasets.py
@@ -46,6 +68,8 @@
 	停滞の中の小さい赤青は、すべて停滞に。
 　	061918
 ```
+
+私の提案
 
 前線のデータは6クラス（前線なし=0, 温暖前線=1, 寒冷前線=2, 停滞前線=3, 閉塞前線=4, 温暖前線と寒冷前世の繋ぎ目=5）
 
@@ -111,3 +135,11 @@ src/FrontLine/main_v4.py
 完璧なプログラムを作成してください
 また自分のアルゴリズムが適切かどうかを日本語で判断して考察してください
 日本語で解説
+
+---
+
+違うところは日本語で現状の処理の報告、改善提案をしてください
+細かいv4の処理についてもみてください
+私はとりあえず上記の私提案の処理をv4に落とし込みたいです
+結果画像の出力やswin-unetの実装、エラーが起きる原因がないか、処理速度を落としている原因はないかなどを詳しくみてください
+改善点について完璧に教えてください

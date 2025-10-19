@@ -85,6 +85,74 @@ def _setup_matplotlib_fonts_and_warnings():
 # モジュール読み込み時に一度だけ適用
 _setup_matplotlib_fonts_and_warnings()
 
+def _to_1d_lat_lon(lat, lon):
+    """
+    lat/lon が 2次元格子として保存されている場合でも、可視化処理が期待する 1次元座標へ正規化する。
+    """
+    lat = np.asarray(lat)
+    lon = np.asarray(lon)
+    try:
+        if lat.ndim == 2 and lat.shape[1] == 1:
+            lat = lat[:, 0]
+        elif lat.ndim == 2 and lat.shape[0] == 1:
+            lat = lat[0, :]
+    except Exception:
+        pass
+    try:
+        if lon.ndim == 2 and lon.shape[0] == 1:
+            lon = lon[0, :]
+        elif lon.ndim == 2 and lon.shape[1] == 1:
+            lon = lon[:, 0]
+    except Exception:
+        pass
+    if lat.ndim != 1:
+        lat = np.squeeze(lat)
+        if lat.ndim != 1:
+            lat = lat.ravel()
+    if lon.ndim != 1:
+        lon = np.squeeze(lon)
+        if lon.ndim != 1:
+            lon = lon.ravel()
+    return lat, lon
+
+
+def _align_to_hw(arr, H, W, fill=0):
+    """
+    任意形状の配列 arr を (H, W) の2次元に切り詰め＋ゼロ埋め（fill値）で整形するヘルパー。
+    - 3Dで先頭が1のときは squeeze
+    - 1D かつ要素数が H*W と一致すれば reshape
+    - それ以外は左上へ可能範囲で貼り付け、残りを fill で埋める
+    """
+    a = np.asarray(arr)
+    if a.ndim == 0:
+        out = np.zeros((H, W), dtype=a.dtype)
+        out[:] = fill
+        return out
+    if a.ndim == 3 and a.shape[0] == 1:
+        a = a[0]
+    a = np.squeeze(a)
+    if a.ndim == 1:
+        if a.size == H * W:
+            a = a.reshape(H, W)
+        else:
+            tmp = np.full((H, W), fill, dtype=a.dtype)
+            lim = min(a.size, H * W)
+            tmp.ravel()[:lim] = a.ravel()[:lim]
+            return tmp
+    if a.ndim != 2:
+        tmp = np.full((H, W), fill, dtype=a.dtype)
+        hh = min(H, a.shape[0] if a.ndim >= 1 else 0)
+        ww = min(W, a.shape[1] if a.ndim >= 2 else 0)
+        try:
+            tmp[:hh, :ww] = a[:hh, :ww]
+        except Exception:
+            pass
+        return tmp
+    out = np.full((H, W), fill, dtype=a.dtype)
+    hh = min(H, a.shape[0]); ww = min(W, a.shape[1])
+    out[:hh, :ww] = a[:hh, :ww]
+    return out
+
 
 def _list_nc(dir_path: str, prefix: str = "", suffix: str = ".nc"):
     """
@@ -298,6 +366,8 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
     t_dt = pd.to_datetime(time_val) if time_val is not None else None
     lat = ds["lat"].values
     lon = ds["lon"].values
+    # 強制的に1次元座標へ正規化（2D格子に保存されているケース対策）
+    lat, lon = _to_1d_lat_lon(lat, lon)
 
     h, w = len(lat), len(lon)
     pred = np.zeros((h, w), dtype=np.int64)
@@ -312,7 +382,11 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
         warm = np.zeros((h, w), dtype=np.uint8)
         cold = np.zeros((h, w), dtype=np.uint8)
         if t_dt_local is None:
-            return warm, cold, jmask
+            # (h,w) へ整形して返す
+            warm_al = _align_to_hw(warm, h, w)
+            cold_al = _align_to_hw(cold, h, w)
+            jmask_al = _align_to_hw(jmask, h, w)
+            return warm_al, cold_al, jmask_al
         token = t_dt_local.strftime("%Y%m%d%H%M")
         # Stage2.5 warm/cold (+ junction if available)
         wcpath = os.path.join(stage2_5_out_dir, f"refined_{token}.nc")
@@ -352,6 +426,10 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
                         jmask = (np.squeeze(jarr) > 0).astype(np.uint8)
                     elif "class_map" in jd:
                         jmask = (jd["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+        # (h,w) へ整形して返す
+        warm = _align_to_hw(warm, h, w)
+        cold = _align_to_hw(cold, h, w)
+        jmask = _align_to_hw(jmask, h, w)
         return warm, cold, jmask
 
     try:
@@ -438,6 +516,8 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
             occ = (arr > 0).astype(np.uint8)
+            # (h,w) に整形
+            occ = _align_to_hw(occ, h, w)
             warm, cold, jmask = _load_fixed_layers(t_dt)
             pred = np.zeros((h, w), dtype=np.int64)
             pred[jmask == 1] = 5
@@ -470,6 +550,8 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
                             arr = np.squeeze(np.asarray(arr))
                             if arr.ndim == 2:
                                 occ = (arr > 0.5).astype(np.uint8)
+            # (h,w) に整形
+            occ = _align_to_hw(occ, h, w)
             pred = np.zeros((h, w), dtype=np.int64)
             pred[jmask == 1] = 5
             mask = (pred == 0) & (warm == 1)
