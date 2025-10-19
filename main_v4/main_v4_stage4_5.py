@@ -15,6 +15,7 @@
     - 出力:
         * stage4_5_out_dir/stationary_YYYYMMDDHHMM.nc            （変数名: "class_map" 0/1）
         * final_out_dir/final_YYYYMMDDHHMM.nc                     （変数名: "class_map" 0..5）
+        * stage4_5_out_dir/final_YYYYMMDDHHMM.nc                  （変数名: "class_map" 0..5, 運用便宜のため最終6値を本ディレクトリにも保存）
 
 要件対応（原文抜粋）:
     - 「stege4.5 … 1マスのみの停滞や小さな塊を削除」
@@ -318,31 +319,33 @@ def _assemble_final(warm: np.ndarray, cold: np.ndarray, sta: np.ndarray, occ: np
     """
     確定順に積み上げる合成（後段で上書きしない）
     - まず接合=5 を固定（以降の段階で上書き不可）
-    - 次に温暖=1、寒冷=2 を固定（以降の段階で上書き不可）
-    - 次に閉塞=4（ただし既に埋まっている画素は上書きしない）
-    - 最後に停滞=3（ただし既に埋まっている画素は上書きしない）
+    - 次に閉塞=4 を final==0 の場所にのみ配置（上書き禁止）
+    - 次に停滞=3 を final==0 の場所にのみ配置（上書き禁止）
+    - 次に寒冷=2 を final==0 の場所にのみ配置（上書き禁止）
+    - 最後に温暖=1 を final==0 の場所にのみ配置（上書き禁止）
+    （最終優先順位: 5 > 4 > 3 > 2 > 1 > 0）
     """
     H, W = warm.shape
     final = np.zeros((H, W), dtype=np.int64)
 
-    # 1) 接合=5 を先に確定
+    # 1) 接合=5
     final[junc == 1] = 5
 
-    # 2) 温暖=1 を final==0 の場所にのみ配置（上書き禁止）
-    mask = (final == 0) & (warm == 1)
-    final[mask] = 1
-
-    # 3) 寒冷=2 を final==0 の場所にのみ配置（上書き禁止）
-    mask = (final == 0) & (cold == 1)
-    final[mask] = 2
-
-    # 4) 閉塞=4 を final==0 の場所にのみ配置（上書き禁止）
+    # 2) 閉塞=4
     mask = (final == 0) & (occ == 1)
     final[mask] = 4
 
-    # 5) 停滞=3 を final==0 の場所にのみ配置（上書き禁止）
+    # 3) 停滞=3
     mask = (final == 0) & (sta == 1)
     final[mask] = 3
+
+    # 4) 寒冷=2
+    mask = (final == 0) & (cold == 1)
+    final[mask] = 2
+
+    # 5) 温暖=1
+    mask = (final == 0) & (warm == 1)
+    final[mask] = 1
 
     return final
 
@@ -381,10 +384,11 @@ def process_one_time(s4_prob_path: str, s3_5_path: str, s2_5_path: str, s1_5_pat
     # 出力パス（先に作ってスキップ判定）
     out_s = os.path.join(stage4_5_out_dir, f"stationary_{t_dt.strftime('%Y%m%d%H%M')}.nc")
     out_f = os.path.join(final_out_dir,  f"final_{t_dt.strftime('%Y%m%d%H%M')}.nc")
+    out_f_stage45 = os.path.join(stage4_5_out_dir, f"final_{t_dt.strftime('%Y%m%d%H%M')}.nc")
 
-    # 出力済みスキップ（両方揃っていればスキップ）
-    if os.path.exists(out_s) and os.path.exists(out_f):
-        print(f"[V4-Stage4.5] Skip existing outputs: {os.path.basename(out_s)}, {os.path.basename(out_f)}")
+    # 出力済みスキップ（stationary と final の両方が両ディレクトリに存在する場合のみスキップ）
+    if os.path.exists(out_s) and os.path.exists(out_f) and os.path.exists(out_f_stage45):
+        print(f"[V4-Stage4.5] Skip existing outputs: {os.path.basename(out_s)}, {os.path.basename(out_f)}, {os.path.basename(out_f_stage45)}")
         return
 
     # 保存: stationary refined（アトミック・リトライ）
@@ -398,15 +402,20 @@ def process_one_time(s4_prob_path: str, s3_5_path: str, s2_5_path: str, s1_5_pat
             print(f"[V4-Stage4.5] Failed to save (stationary): {out_s}")
     del ds_s, da_s
 
-    # 保存: final class map（アトミック・リトライ）
+    # 保存: final class map（アトミック・リトライ）… final_out_dir と stage4_5_out_dir の双方へ出力
     os.makedirs(final_out_dir, exist_ok=True)
+    os.makedirs(stage4_5_out_dir, exist_ok=True)
     da_f = xr.DataArray(final.astype(np.int64), dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
     ds_f = xr.Dataset({"class_map": da_f}).expand_dims("time")
     ds_f["time"] = [t_dt]
     if not os.path.exists(out_f):
         ok = atomic_save_netcdf(ds_f, out_f, engine="netcdf4", retries=3, sleep_sec=0.5)
         if not ok:
-            print(f"[V4-Stage4.5] Failed to save (final): {out_f}")
+            print(f"[V4-Stage4.5] Failed to save (final @final_out_dir): {out_f}")
+    if not os.path.exists(out_f_stage45):
+        ok2 = atomic_save_netcdf(ds_f, out_f_stage45, engine="netcdf4", retries=3, sleep_sec=0.5)
+        if not ok2:
+            print(f"[V4-Stage4.5] Failed to save (final @stage4_5_out_dir): {out_f_stage45}")
     del ds_f, da_f
 
     gc.collect()

@@ -45,7 +45,7 @@ def _list_prob_files(nc_dir: str):
 def _load_probs_2(path: str):
     """
     関数概要:
-      Stage1 の確率 NetCDF（prob_*.nc）から、(H,W,C=2) の probabilities と座標 lat/lon、time を読み出す。
+      Stage1 の確率 NetCDF（prob_*.nc）から、(H,W,C=6) の probabilities と座標 lat/lon、time を読み出す。
     入力:
       - path (str): prob_*.nc のフルパス
     処理:
@@ -53,11 +53,11 @@ def _load_probs_2(path: str):
       - lat/lon 座標と time[0] をあわせて取得
     出力:
       - Tuple[np.ndarray, np.ndarray, np.ndarray, pd.Timestamp]:
-        (probs(H,W,2), lat(H,), lon(W,), 時刻Timestamp)
+        (probs(H,W,6), lat(H,), lon(W,), 時刻Timestamp)
     """
     import xarray as xr
     ds = xr.open_dataset(path)
-    probs = ds["probabilities"].isel(time=0).values  # (H,W,C=2)
+    probs = ds["probabilities"].isel(time=0).values  # (H,W,C=6)
     lat = ds["lat"].values
     lon = ds["lon"].values
     tval = ds["time"].values[0]
@@ -133,8 +133,8 @@ def process_one_file(prob_path: str,
       - max_area_to_shrink (int): 面積がこの値を超える成分は重心付近の 2x2 へ縮退
       - connectivity (int): 連結性（4 or 8 相当）。8 以上なら connectivity=2 を採用（skimage.label の仕様）
     処理:
-      1) _load_probs_2 で (H,W,2) probabilities と座標/時刻を読み出す
-      2) argmax により class=1（junction）を二値化
+      1) _load_probs_2 で (H,W,6) probabilities と座標/時刻を読み出す
+      2) argmax により class=5（junction）を二値化
       3) _refine_junction_mask で面積規則に基づく整形（小領域除去/2x2 縮退/現状維持）
       4) (time, lat, lon) 次元を持つ Dataset に "junction" 変数として保存
     出力:

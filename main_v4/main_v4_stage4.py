@@ -4,7 +4,7 @@
     - 学習: 入力 = GSM(93) + GT junction(1) + GT warm(1) + GT cold(1) + GT occluded(1) → (97ch)
             目標 = 2クラス (0:none,1:stationary)
     - 推論: 入力 = GSM(93) + Stage2.5 junction + Stage2.5 warm + Stage2.5 cold + Stage3.5 occluded → (97ch)
-    - 出力: probabilities(H,W,C=2) を NetCDF (time, lat, lon, class) で保存
+    - 出力: probabilities(H,W,C=2) と 6値 class_map（class_map_combined: 5/1/2/4/3/0）を NetCDF に保存
 
 要件との対応:
     - 「Stage4の学習では、温暖(1), 寒冷(2), 停滞(3), 閉塞(4), 接合(5), および気象変数データ」
@@ -155,6 +155,8 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
     """
     関数概要:
       学習済み Stage4 モデルで推論を行い、各サンプルのクラス確率 (H,W,C=2) を NetCDF に保存する。
+      併せて「Stage2.5 の warm/cold/junction（refined_*.nc）と Stage3.5 の occluded（occluded_*.nc）に、予測した stationary=3 を重畳した
+      6値 class_map（class_map_combined: 5/1/2/4/3/0）」も同ファイルに保存する。
 
     入力:
       - model (nn.Module): 学習済みモデル
@@ -165,6 +167,9 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
     処理:
       - model.eval() + no_grad で各バッチを推論し softmax で確率へ変換
       - 各時刻について (H,W,C) 配列を "probabilities" 変数として保存（dims=["lat","lon","class"]）
+      - Stage2.5 refined_YYYYMMDDHHMM.nc を読み、junction=5 と warm/cold=1/2 を固定
+      - Stage3.5 occluded_YYYYMMDDHHMM.nc を読み、occluded=4 を固定（既確定の 5/1/2 を上書きしない）
+      - argmax により stationary を 3 として残余に配置（既確定の 5/1/2/4 を上書きしない）
       - "time" 次元を 1 つ持つ Dataset として保存
 
     出力:
@@ -191,13 +196,90 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
                     dims=["lat", "lon", "class"],
                     coords={"lat": lats, "lon": lons, "class": np.arange(num_classes)},
                 )
-                ds = xr.Dataset({"probabilities": da}).expand_dims("time")
+                # 時刻トークン
                 try:
                     t_dt = pd.to_datetime(tstr)
                 except Exception:
                     t_dt = pd.to_datetime(str(tstr))
+                token = t_dt.strftime("%Y%m%d%H%M")
+
+                H, W = arr.shape[0], arr.shape[1]
+                # stationary 予測の2値化（argmax==1）
+                cls = np.argmax(arr, axis=-1).astype(np.int64)  # (H,W) 0/1
+                sta_pred = (cls == 1).astype(np.uint8)
+
+                # Stage2.5 refined（warm/cold/junction）の読込
+                import xarray as xr
+                refined_path = os.path.join(CFG["PATHS"]["stage2_5_out_dir"], f"refined_{token}.nc")
+                warm = np.zeros((H, W), dtype=np.uint8)
+                cold = np.zeros((H, W), dtype=np.uint8)
+                junc = np.zeros((H, W), dtype=np.uint8)
+                if os.path.exists(refined_path):
+                    try:
+                        with xr.open_dataset(refined_path) as rd:
+                            if "class_map" in rd:
+                                v = rd["class_map"]
+                                arr_cm = v.isel(time=0).values if "time" in v.dims else v.values
+                                arr_cm = np.squeeze(np.asarray(arr_cm))
+                                if arr_cm.ndim == 2:
+                                    # サイズを (H,W) に揃える
+                                    hh = min(H, arr_cm.shape[0]); ww = min(W, arr_cm.shape[1])
+                                    tmp = np.zeros((H, W), dtype=np.uint8)
+                                    tmp[:hh, :ww] = arr_cm[:hh, :ww]
+                                    warm = (tmp == 1).astype(np.uint8)
+                                    cold = (tmp == 2).astype(np.uint8)
+                            if "junction" in rd:
+                                vj = rd["junction"]
+                                jarr = vj.isel(time=0).values if "time" in vj.dims else vj.values
+                                jarr = np.squeeze(np.asarray(jarr))
+                                tmpj = np.zeros((H, W), dtype=np.uint8)
+                                hh = min(H, jarr.shape[0]); ww = min(W, jarr.shape[1])
+                                tmpj[:hh, :ww] = jarr[:hh, :ww]
+                                junc = tmpj.astype(np.uint8)
+                    except Exception:
+                        pass
+
+                # Stage3.5 occluded の読込
+                occ = np.zeros((H, W), dtype=np.uint8)
+                occ_path = os.path.join(CFG["PATHS"]["stage3_5_out_dir"], f"occluded_{token}.nc")
+                if os.path.exists(occ_path):
+                    try:
+                        with xr.open_dataset(occ_path) as od:
+                            if "class_map" in od:
+                                v = od["class_map"]
+                                oarr = v.isel(time=0).values if "time" in v.dims else v.values
+                                oarr = np.squeeze(np.asarray(oarr))
+                                tmpo = np.zeros((H, W), dtype=np.uint8)
+                                hh = min(H, oarr.shape[0]); ww = min(W, oarr.shape[1])
+                                tmpo[:hh, :ww] = oarr[:hh, :ww]
+                                occ = (tmpo > 0).astype(np.uint8)
+                            elif "occluded" in od:
+                                v = od["occluded"]
+                                oarr = v.isel(time=0).values if "time" in v.dims else v.values
+                                oarr = np.squeeze(np.asarray(oarr))
+                                tmpo = np.zeros((H, W), dtype=np.uint8)
+                                hh = min(H, oarr.shape[0]); ww = min(W, oarr.shape[1])
+                                tmpo[:hh, :ww] = oarr[:hh, :ww]
+                                occ = (tmpo > 0.5).astype(np.uint8)
+                    except Exception:
+                        pass
+
+                # 6値合成: 5（junction固定） / 1 / 2 / 4 / 3 / 0
+                cm = np.zeros((H, W), dtype=np.int64)
+                cm[junc == 1] = 5
+                mask = (cm == 0) & (warm == 1)
+                cm[mask] = 1
+                mask = (cm == 0) & (cold == 1)
+                cm[mask] = 2
+                mask = (cm == 0) & (occ == 1)
+                cm[mask] = 4
+                mask = (cm == 0) & (sta_pred == 1)
+                cm[mask] = 3
+
+                da_cm = xr.DataArray(cm, dims=["lat", "lon"], coords={"lat": lats, "lon": lons})
+                ds = xr.Dataset({"probabilities": da, "class_map_combined": da_cm}).expand_dims("time")
                 ds["time"] = [t_dt]
-                out_name = os.path.join(save_dir, f"prob_{t_dt.strftime('%Y%m%d%H%M')}.nc")
+                out_name = os.path.join(save_dir, f"prob_{token}.nc")
                 # 出力済みスキップ + アトミック書き込み（リトライ付き）
                 if os.path.exists(out_name):
                     print(f"[V4-Stage4] Skip existing output: {os.path.basename(out_name)}")
@@ -205,7 +287,7 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
                     ok = atomic_save_netcdf(ds, out_name, engine="netcdf4", retries=3, sleep_sec=0.5)
                     if not ok:
                         print(f"[V4-Stage4] Failed to save: {out_name}")
-                del ds, da
+                del ds, da, da_cm
             del prob, logits, prob_np
             gc.collect()
     print(f"[V4-Stage4] Probabilities saved -> {save_dir}")

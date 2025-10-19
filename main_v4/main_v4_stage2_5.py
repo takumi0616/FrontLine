@@ -4,19 +4,22 @@
     - 入力:
         * Stage2 の確率出力 (C=3: none/warm/cold) → argmax で class_map を得る
         * Stage1.5 の junction マスク (0/1)
-    - 論理:
+    - 論理（3段階で厳密に制約を適用）:
         1) 温暖(=1)・寒冷(=2)の union（front_mask）に対して連結成分ラベリング
            → 繋ぎ目(junction)に接続していない front 成分は全て削除（noneにする）
-        2) junction についても、各 junction 成分が「温暖にも寒冷にも」接している場合のみ残す
-           → 片側しか付いていない junction 成分は削除（0）
+        2) junction 成分について「温暖にも寒冷にも接している（両側接触）」もののみ残す
+           → 片側にしか接していない junction 成分は削除（0）
+        3) 2)で残した junction（両側接触のみ）に“連結している”温暖/寒冷成分のみを再度残す
+           → 両側接触の junction に連結していない温暖/寒冷（＝片側のみの接続）は削除
     - 出力:
-        * class_map (H,W) int64（0:none, 1:warm, 2:cold）を NetCDF (time,lat,lon) で保存
+        * class_map (H,W) int64（0:none, 1:warm, 2:cold）と、junction (0/1) を NetCDF (time,lat,lon) で保存
           ファイル名: refined_YYYYMMDDHHMM.nc
 
 要件対応（原文抜粋）:
     - 「温暖前線と寒冷前世の繋ぎ目=5と繋がっている部分のみを残す（繋ぎ目から前線ありのマスを通って繋がっていること）」
     - 「温暖前線のみのもの、寒冷前線のみのものは削除」
     - 「繋ぎ目=5は、温暖と寒冷のどっちとも繋がっているもののみ残し、片側のみは削除」
+    - さらに 2) で junction を厳格化した後に 3) で温暖/寒冷を再フィルタすることで、双方の制約を整合的に満たす。
 """
 
 import os
@@ -218,7 +221,8 @@ def process_one_time(s2_path: str, junc_path: str, out_dir: str, connectivity: i
     """
     関数概要:
       単一時刻に対して Stage2 確率出力からの class_map と Stage1.5 junction を用い、
-      front の junction 接続フィルタ + junction の両側接触フィルタを適用した結果を保存する。
+      1) front の junction 接続フィルタ → 2) junction の両側接触フィルタ → 3) 両側接触 junction に再連結する front のみ残す
+      の3段階の論理整形を適用した結果を保存する。
 
     入力:
       - s2_path (str): prob_*.nc（Stage2 確率出力）
@@ -229,9 +233,10 @@ def process_one_time(s2_path: str, junc_path: str, out_dir: str, connectivity: i
     処理:
       1) _load_stage2_class_map で class_map/lat/lon/time を取得
       2) _load_junction_mask で junction（0/1）を取得
-      3) _keep_fronts_connected_to_junction で front を junction 接続でフィルタ
-      4) _filter_junction_must_touch_both で junction を両側接触フィルタ
-      5) class_map と junction を同一ファイルに保存（refined_*.nc）
+      3) _keep_fronts_connected_to_junction(cls_map, junc) で front を junction 接続で一次フィルタ
+      4) _filter_junction_must_touch_both(junc, refined) で junction を両側接触のみへ厳格化
+      5) _keep_fronts_connected_to_junction(cls_map, junc_filtered) を用いて、厳格化後の junction に再連結する front のみを残す
+      6) class_map と junction を同一ファイルに保存（refined_*.nc）
 
     出力:
       - 返り値なし（ファイル保存の副作用）。保存変数: "class_map"(0/1/2), "junction"(0/1)
@@ -239,17 +244,20 @@ def process_one_time(s2_path: str, junc_path: str, out_dir: str, connectivity: i
     import xarray as xr
     cls_map, lat, lon, t_dt = _load_stage2_class_map(s2_path)
     junc, lat_j, lon_j = _load_junction_mask(junc_path)
-    # 一応形状の整合
+    # 形状の整合（緯度経度軸とマスクの最小共通サイズへ合わせる）
     H = min(len(lat), junc.shape[0]); W = min(len(lon), junc.shape[1])
     cls_map = cls_map[:H, :W]
     junc = junc[:H, :W]
     lat = lat[:H]; lon = lon[:W]
 
-    # 1) front を junction 接続でフィルタ
-    refined = _keep_fronts_connected_to_junction(cls_map, junc, connectivity=connectivity)
+    # 1) front を「元の junction」に連結するもののみ残す（一次フィルタ）
+    refined_once = _keep_fronts_connected_to_junction(cls_map, junc, connectivity=connectivity)
 
-    # 2) junction 成分の両側接触によるフィルタ（junc自体の保存は optional）
-    junc_filtered = _filter_junction_must_touch_both(junc, refined, connectivity=connectivity)
+    # 2) junction 成分を「温暖/寒冷の両側に接する」もののみ残す（厳格化）
+    junc_filtered = _filter_junction_must_touch_both(junc, refined_once, connectivity=connectivity)
+
+    # 3) 2)の厳格化 junction に“連結している” front（温暖/寒冷）のみを再度残す（最終 class_map）
+    refined = _keep_fronts_connected_to_junction(cls_map, junc_filtered, connectivity=connectivity)
 
     # 保存（class_map と junction を同一ファイルに格納）
     os.makedirs(out_dir, exist_ok=True)
@@ -273,7 +281,7 @@ def process_one_time(s2_path: str, junc_path: str, out_dir: str, connectivity: i
         if not ok:
             print(f"[V4-Stage2.5] Failed to save: {out}")
         del ds, da_cls, da_junc
-    del refined, junc_filtered, cls_map, junc
+    del refined_once, refined, junc_filtered, cls_map, junc
     gc.collect()
 
 def run_stage2_5():

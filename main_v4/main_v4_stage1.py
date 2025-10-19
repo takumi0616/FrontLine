@@ -1,14 +1,15 @@
 """
 概要:
-    Stage1（接合=5 のみ、二値）の学習・評価・推論モジュール。
+    Stage1（6クラス: 0:none,1:warm,2:cold,3:stationary,4:occluded,5:junction）の学習・評価・推論モジュール。
     - 入力: GSM 93ch（t-6h, t, t+6h × 31変数）
-    - 出力: 2クラス (0:none, 1:junction) のロジット/確率
-    - 評価時は probabilities(H,W,C=2) を NetCDF (time, lat, lon, class) で保存
+    - 出力: 6クラス (0..5) のロジット/確率
+    - 評価時は probabilities(H,W,C=6) を NetCDF (time, lat, lon, class) で保存
+    - 併せて「junction=5 を固定、その他は0」の 0/5 二値 class_map（class_map_0_5）も同ファイルに保存
 
 設計方針:
-    - v3 の学習ループ/保存形式を踏襲しつつ、クラス数=2 に最適化
+    - v3 の学習ループ/保存形式を踏襲しつつ、クラス数=6 に最適化
     - v4_datasets の V4DatasetStage1Train/Test を利用
-    - 保存は CFG["PATHS"]["stage1_out_dir"] に prob_YYYYMMDDHHMM.nc として出力
+    - 保存は CFG["PATHS"]["stage1_out_dir"] に prob_YYYYMMDDHHMM.nc（probabilities + class_map_0_5）として出力
 """
 
 import os
@@ -40,7 +41,7 @@ from .main_v4_visualize import run_visualization_for_stage
 def train_one_epoch(model, loader, optimizer, loss_fn, epoch: int, num_classes: int):
     """
     関数概要:
-      Stage1（junction=5 の二値分類）モデルを 1 エポック分学習する。
+      Stage1（6クラス分類）モデルを 1 エポック分学習する。
 
     入力:
       - model (nn.Module): 学習対象モデル（SwinUnetModel）
@@ -48,7 +49,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, epoch: int, num_classes: 
       - optimizer (torch.optim.Optimizer): 最適化手法（AdamW など）
       - loss_fn (Callable): 損失関数（CE + Dice の複合を想定）
       - epoch (int): 現在のエポック番号（0 始まり）
-      - num_classes (int): クラス数（Stage1 は 2）
+      - num_classes (int): クラス数（Stage1 は 6）
 
     処理:
       - モデルを train モードに設定
@@ -116,7 +117,7 @@ def eval_one_epoch(model, loader, loss_fn, epoch: int, num_classes: int):
       - loader (DataLoader): 検証用データローダ（V4DatasetStage1Train の別インスタンスなど）
       - loss_fn (Callable): 損失関数（CE + Dice）
       - epoch (int): 現在のエポック番号（0 始まり）
-      - num_classes (int): クラス数（2）
+      - num_classes (int): クラス数（6）
 
     処理:
       - モデルを eval モードに設定（no_grad）
@@ -161,17 +162,19 @@ def eval_one_epoch(model, loader, loss_fn, epoch: int, num_classes: int):
 def export_probabilities(model, loader, save_dir: str, num_classes: int):
     """
     関数概要:
-      学習済み Stage1 モデルで推論を行い、各サンプルのクラス確率 (H,W,C=2) を NetCDF に保存する。
+      学習済み Stage1 モデルで推論を行い、各サンプルのクラス確率 (H,W,C=6) を NetCDF に保存する。
+      併せて「junction=5 を固定、その他は0」の 0/5 二値 class_map（class_map_0_5）も同ファイルに保存する。
 
     入力:
       - model (nn.Module): 学習済みモデル
-      - loader (DataLoader): 推論用データローダ（V4DatasetStage1Test を想定）
+      - loader (DataLoader): 推論用データローダ（V4DatasetStage1Test あるいは同等の (x,*,timestr) を返す Dataset）
       - save_dir (str): 出力ディレクトリ（prob_YYYYMMDDHHMM.nc を保存）
-      - num_classes (int): クラス数（2）
+      - num_classes (int): クラス数（6）
 
     処理:
       - model.eval() + no_grad で各バッチを推論し softmax で確率へ変換
       - 各時刻について (H,W,C) 配列を "probabilities" 変数として保存（dims=["lat","lon","class"]）
+      - さらに argmax により 0/5 二値 class_map を作り "class_map_0_5" 変数として同梱
       - "time" 次元を 1 つ持つ Dataset として保存
 
     出力:
@@ -206,7 +209,12 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
             dims=["lat", "lon", "class"],
             coords={"lat": lats, "lon": lons, "class": np.arange(num_classes)},
         )
-        ds = xr.Dataset({"probabilities": da})
+        # 0/5 二値 class_map（junction=5 を固定、その他は0）も併産出
+        cls = np.argmax(arr, axis=-1).astype(np.int64)  # (H,W)
+        cm05 = np.where(cls == 5, 5, 0).astype(np.int64)
+        da_cm05 = xr.DataArray(cm05, dims=["lat", "lon"], coords={"lat": lats, "lon": lons})
+
+        ds = xr.Dataset({"probabilities": da, "class_map_0_5": da_cm05})
         ds = ds.expand_dims("time")
         try:
             t_dt = pd.to_datetime(tstr)
@@ -229,7 +237,7 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
 def run_stage1():
     """
     関数概要:
-      Stage1（junction=5 の二値分類）のフルパイプラインを実行する。
+      Stage1（6クラス分類）のフルパイプラインを実行する。
       データセット構築→モデル学習・検証→最良モデル保存→損失曲線の保存→test セットでの確率出力（NetCDF）。
 
     入力:

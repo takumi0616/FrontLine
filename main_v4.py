@@ -7,15 +7,26 @@
   入力: 直接的な関数引数は無し（各ステージ内で CFG と NetCDF 入出力を行う）。
   出力: 各ステージの成果物（NetCDF）と、その可視化 PNG、標準出力ログ。
 - 全体フロー（要点のみ。詳細は各ステージのモジュールを参照）:
-  1) Stage1   : junction=5（二値）を Swin-UNet で学習・推論 → prob_*.nc
-  2) Stage1.5 : junction の論理整形（小領域除去・2x2 縮退）→ junction_*.nc
-  3) Stage2   : warm/cold（3クラス: none/warm/cold、入力=GSM+GT/推論=GSM+Stage1.5）→ prob_*.nc
-  4) Stage2.5 : front を junction 接続でフィルタ + junction は「両側（warm&cold）接触のみ」残す → refined_*.nc
-                以降の推論（Stage3/Stage4, 3.5/4.5, 可視化）では「Stage2.5 後の junction」を一貫して使用
-  5) Stage3   : occluded（二値、学習=GSM+GT junc+GT warm+GT cold、推論=GSM+Stage2.5 junc+warm+cold）→ prob_*.nc
-  6) Stage3.5 : occluded は warm/cold/junction のいずれかに付着するもののみ残す → occluded_*.nc
-  7) Stage4   : stationary（二値、学習=GSM+GT junc+GT warm+GT cold+GT occ、推論=GSM+Stage2.5 junc+warm+cold+Stage3.5 occ）→ prob_*.nc
-  8) Stage4.5 : 小停滞除去 + 「寒冷に付着した停滞」を寒冷へ再分類 + 最終 0..5 クラスへ合成 → final_*.nc
+  1) Stage1   : 6クラス (0:none,1:warm,2:cold,3:stationary,4:occluded,5:junction) を Swin-UNet で学習・推論
+                出力は probabilities(H,W,C=6) と 0/5 二値 class_map（class_map_0_5）→ prob_*.nc
+  2) Stage1.5 : junction の論理整形（小領域除去・過大領域の中心2x2縮退）→ junction_*.nc（junction:0/1）
+  3) Stage2   : warm/cold（3クラス: none/warm/cold、学習=GSM+GT junc、推論=GSM+Stage1.5 junc）
+                出力は probabilities と「junction=5 固定＋1/2 重畳」の 4値 class_map（class_map_combined: 5/1/2/0）
+  4) Stage2.5 : 3段階の厳格化
+                (a) front（1/2）を“元の junction”に連結するものだけ一次フィルタ
+                (b) junction を「warm/cold 両側接触のみ」に厳格化
+                (c) 厳格化済み junction に“連結する” front のみ再フィルタ
+                → refined_*.nc（class_map:0/1/2, junction:0/1）
+                以降（Stage3/4 系）はこの厳格化 junction を一貫して使用
+  5) Stage3   : occluded（二値、学習=GSM+GT junc+GT warm+GT cold、推論=GSM+Stage2.5 junc+warm+cold）
+                出力は probabilities と 5値 class_map（class_map_combined: 5/1/2/4/0）
+  6) Stage3.5 : occluded は warm/cold/junction のいずれかに付着するもののみ残す → occluded_*.nc（class_map:0/1）
+  7) Stage4   : stationary（二値、学習=GSM+GT junc+GT warm+GT cold+GT occ、推論=GSM+Stage2.5 junc+warm+cold + Stage3.5 occ）
+                出力は probabilities と 6値 class_map（class_map_combined: 5/1/2/4/3/0）
+  8) Stage4.5 : 小停滞除去（面積≤25） + 「寒冷に付着した停滞」を寒冷へ再分類
+                最終合成の優先順位は 5 > 4 > 3 > 2 > 1 > 0（上書き禁止の順序合成）
+                出力: stationary_*.nc（class_map:0/1）, final_*.nc（class_map:0..5）
+                final は final_out_dir と stage4_5_out_dir の双方に保存
 - 実装上の注意:
   - 計測用のメモリ・時間ログを出力する。
   - 可視化は各ステージ終了直後に run_visualization_for_stage で実行。
@@ -46,15 +57,15 @@ def main():
       なし（関数引数は無し）。各ステージは内部で CFG（環境設定）と入出力パスを参照する。
 
     処理:
-      - Stage1: junction(=5) を二値で学習/推論
-      - Stage1.5: junction の論理整形（小領域除去・2x2化）
-      - Stage2: warm/cold（3クラス）を学習/推論（推論では Stage1.5 junction を使用）
-      - Stage2.5: warm/cold を junction 接続でフィルタ、junction は「両側接触のみ」残す
-                  → 以降は Stage2.5 後の junction を「唯一の junction」として使用
-      - Stage3: occluded（二値）を学習/推論（推論は Stage2.5 の junc, warm, cold を使用）
-      - Stage3.5: occluded の「付着」制約（warm/cold/junction のいずれかに接している画素のみ残す）
-      - Stage4: stationary（二値）を学習/推論（推論は Stage2.5+junc,warm,cold と Stage3.5 occ を使用）
-      - Stage4.5: 小停滞除去 + 停滞→寒冷再分類 + 最終合成（優先度: 5>4>3>2>1>0）
+      - Stage1: 6クラス（0..5）を学習/推論し、probabilities と class_map_0_5（0/5）を保存
+      - Stage1.5: junction の論理整形（小領域除去・過大領域の中心2x2化）
+      - Stage2: warm/cold（3クラス）を学習/推論し、probabilities と「junction=5 固定＋1/2」の class_map_combined を保存
+      - Stage2.5: front の junction 連結で一次フィルタ → junction を両側接触のみへ厳格化 → 厳格化 junction への再連結 front のみを残す
+                  → 以降はこの厳格化 junction を一貫して使用
+      - Stage3: occluded（二値）を学習/推論し、probabilities と「5/1/2/4/0」の class_map_combined を保存
+      - Stage3.5: occluded の付着制約（warm/cold/junction のいずれかに接している画素のみ残す）
+      - Stage4: stationary（二値）を学習/推論し、probabilities と「5/1/2/4/3/0」の class_map_combined を保存
+      - Stage4.5: 小停滞除去（面積≤25） + 停滞→寒冷再分類 + 最終合成（優先順位: 5>4>3>2>1>0）
       各ステージ後に run_visualization_for_stage により PNG 可視化を出力。
 
     出力:

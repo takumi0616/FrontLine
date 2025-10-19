@@ -3,7 +3,7 @@
     Stage2（温暖=1/寒冷=2、3クラス: none/warm/cold）の学習・評価・推論モジュール。
     - 学習: 入力 = GSM(93) + GT junction(1) → (94ch), 目標 = 3クラス (0:none,1:warm,2:cold)
     - 推論: 入力 = GSM(93) + Stage1.5 junction(1) → (94ch)
-    - 出力: probabilities(H,W,C=3) を NetCDF (time, lat, lon, class) で保存
+    - 出力: probabilities(H,W,C=3) と 4値 class_map（class_map_combined: 5/1/2/0）を NetCDF に保存
 
 要件との対応:
     - 「Stage2の学習では、学習期間の温暖(1), 寒冷(2)、正解の繋ぎ目=5、および気象変数データ」
@@ -161,6 +161,8 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
     """
     関数概要:
       学習済み Stage2 モデルで推論を行い、各サンプルのクラス確率 (H,W,C=3) を NetCDF に保存する。
+      併せて「junction=5（Stage1.5 出力）を固定し、予測した warm=1 / cold=2 を重畳した 4値 class_map（class_map_combined）」も同ファイルに保存する。
+      これにより、理想仕様の「stage2_nc には 5/1/2/0 を含む 4値のデータ」を満たす。
 
     入力:
       - model (nn.Module): 学習済みモデル
@@ -171,6 +173,8 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
     処理:
       - model.eval() + no_grad で各バッチを推論し softmax で確率へ変換
       - 各時刻について (H,W,C) 配列を "probabilities" 変数として保存（dims=["lat","lon","class"]）
+      - Stage1.5 の junction_YYYYMMDDHHMM.nc を読み、junction=5 を固定
+      - argmax により warm/cold を 1/2 として配置（junction=5 を上書きしない）
       - "time" 次元を 1 つ持つ Dataset として保存
 
     出力:
@@ -192,18 +196,66 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
             B = prob_np.shape[0]
             for i in range(B):
                 tstr = times[i]
-                arr = np.transpose(prob_np[i], (1, 2, 0))  # (H,W,C)
+                # 予測確率 (H,W,C)
+                arr = np.transpose(prob_np[i], (1, 2, 0))
+                # 時刻
+                try:
+                    t_dt = pd.to_datetime(tstr)
+                except Exception:
+                    t_dt = pd.to_datetime(str(tstr))
+                token = t_dt.strftime("%Y%m%d%H%M")
+
+                # Stage1.5 junction の読込（0/1 → 5/0）
+                junc = np.zeros((len(lats), len(lons)), dtype=np.uint8)
+                jpath = os.path.join(CFG["PATHS"]["stage1_5_out_dir"], f"junction_{token}.nc")
+                if os.path.exists(jpath):
+                    try:
+                        with xr.open_dataset(jpath) as jd:
+                            if "junction" in jd:
+                                v = jd["junction"]
+                                jarr = v.isel(time=0).values if "time" in v.dims else v.values
+                                junc = np.squeeze(np.asarray(jarr)).astype(np.uint8)
+                            elif "class_map" in jd:
+                                junc = (jd["class_map"].values.astype(np.int64) > 0).astype(np.uint8)
+                    except Exception:
+                        junc = np.zeros_like(junc, dtype=np.uint8)
+                # 2D 正規化（不足時は左上配置）
+                if junc.ndim != 2:
+                    tmp = np.zeros((len(lats), len(lons)), dtype=np.uint8)
+                    try:
+                        hh = min(tmp.shape[0], junc.shape[0]); ww = min(tmp.shape[1], junc.shape[1])
+                        tmp[:hh, :ww] = junc[:hh, :ww]
+                    except Exception:
+                        pass
+                    junc = tmp
+
+                # 0/1/2 class_map（argmax）から warm/cold を抽出
+                cls = np.argmax(arr, axis=-1).astype(np.int64)  # (H,W) 0/1/2
+                warm = (cls == 1).astype(np.uint8)
+                cold = (cls == 2).astype(np.uint8)
+
+                # 4値合成: 5（junction固定） / 1 / 2 / 0
+                cm = np.zeros(cls.shape, dtype=np.int64)
+                cm[junc == 1] = 5
+                mask = (cm == 0) & (warm == 1)
+                cm[mask] = 1
+                mask = (cm == 0) & (cold == 1)
+                cm[mask] = 2
+
+                # 保存配列
                 da = xr.DataArray(
                     arr,
                     dims=["lat", "lon", "class"],
                     coords={"lat": lats, "lon": lons, "class": np.arange(num_classes)},
                 )
-                ds = xr.Dataset({"probabilities": da}).expand_dims("time")
-                try:
-                    t_dt = pd.to_datetime(tstr)
-                except Exception:
-                    t_dt = pd.to_datetime(str(tstr))
+                da_cm = xr.DataArray(
+                    cm,
+                    dims=["lat", "lon"],
+                    coords={"lat": lats, "lon": lons},
+                )
+                ds = xr.Dataset({"probabilities": da, "class_map_combined": da_cm}).expand_dims("time")
                 ds["time"] = [t_dt]
+
                 out_name = os.path.join(save_dir, f"prob_{t_dt.strftime('%Y%m%d%H%M')}.nc")
                 # 出力済みスキップ + アトミック書き込み（リトライ付き）
                 if os.path.exists(out_name):
@@ -212,7 +264,7 @@ def export_probabilities(model, loader, save_dir: str, num_classes: int):
                     ok = atomic_save_netcdf(ds, out_name, engine="netcdf4", retries=3, sleep_sec=0.5)
                     if not ok:
                         print(f"[V4-Stage2] Failed to save: {out_name}")
-                del ds, da
+                del ds, da, da_cm
             del prob, logits, prob_np
             gc.collect()
     print(f"[V4-Stage2] Probabilities saved -> {save_dir}")
