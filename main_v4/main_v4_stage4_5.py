@@ -261,19 +261,37 @@ def _load_stage1_5_junction(nc_path: str):
     """
     import xarray as xr
     ds = xr.open_dataset(nc_path)
-    if "junction" in ds:
-        j = ds["junction"]
-        jmask = (j.isel(time=0).values if "time" in j.dims else j.values).astype(np.uint8)
-    elif "class_map" in ds:
-        # Stage2.5 の refined_* に junction が含まれないケースでは推定しない（全0で安全側フォールバック）
-        jmask = (ds["class_map"].values.astype(np.int64) * 0).astype(np.uint8)
-    else:
-        var = list(ds.data_vars)[0]
-        v = ds[var]
-        jmask = (v.isel(time=0).values if "time" in v.dims else v.values)
-        jmask = (jmask > 0.5).astype(np.uint8)
-    ds.close()
-    return jmask
+    try:
+        if "junction" in ds:
+            j = ds["junction"]
+            arr = j.isel(time=0).values if "time" in j.dims else j.values
+        else:
+            arr = None
+
+        if arr is None:
+            h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+            jmask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            a = np.asarray(arr)
+            if a.ndim == 3 and a.shape[0] == 1:
+                a = a[0]
+            a = np.squeeze(a)
+            if a.ndim != 2:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                tmp = np.zeros((h, w), dtype=np.uint8)
+                try:
+                    hh = min(h, a.shape[-2] if a.ndim >= 2 else 0)
+                    ww = min(w, a.shape[-1] if a.ndim >= 2 else 0)
+                    if hh > 0 and ww > 0:
+                        tmp[:hh, :ww] = (a[..., :hh, :ww] > 0).astype(np.uint8)
+                except Exception:
+                    pass
+                jmask = tmp
+            else:
+                jmask = (a > 0).astype(np.uint8)
+        return jmask
+    finally:
+        ds.close()
 
 
 def _remove_small_components(mask: np.ndarray, min_area: int, connectivity: int) -> np.ndarray:

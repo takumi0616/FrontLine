@@ -72,21 +72,51 @@ def _load_stage3_occluded_prob(nc_path: str):
 def _load_stage2_5_warm_cold(nc_path: str):
     import xarray as xr
     ds = xr.open_dataset(nc_path)
-    if "class_map" in ds:
-        cm = ds["class_map"].values.astype(np.int64)
-        warm = (cm == 1).astype(np.uint8)
-        cold = (cm == 2).astype(np.uint8)
-    else:
-        # fallback
-        if "warm" in ds and "cold" in ds:
-            warm = (ds["warm"].values > 0.5).astype(np.uint8)
-            cold = (ds["cold"].values > 0.5).astype(np.uint8)
+    try:
+        if "class_map" in ds:
+            cm = ds["class_map"]
+            arr = cm.isel(time=0).values if "time" in cm.dims else cm.values
+            arr = np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            arr = np.squeeze(arr)
+            # ensure 2D
+            if arr.ndim != 2:
+                h = int(ds.sizes.get("lat", 0))
+                w = int(ds.sizes.get("lon", 0))
+                tmp = np.zeros((h, w), dtype=arr.dtype if isinstance(arr, np.ndarray) else np.uint8)
+                try:
+                    hh = min(h, arr.shape[-2] if arr.ndim >= 2 else 0)
+                    ww = min(w, arr.shape[-1] if arr.ndim >= 2 else 0)
+                    if hh > 0 and ww > 0:
+                        tmp[:hh, :ww] = arr[..., :hh, :ww]
+                except Exception:
+                    pass
+                arr = tmp
+            warm = (arr == 1).astype(np.uint8)
+            cold = (arr == 2).astype(np.uint8)
         else:
-            h = ds.dims.get("lat", 0); w = ds.dims.get("lon", 0)
-            warm = np.zeros((h, w), dtype=np.uint8)
-            cold = np.zeros((h, w), dtype=np.uint8)
-    ds.close()
-    return warm, cold
+            wv = ds["warm"] if "warm" in ds else None
+            cv = ds["cold"] if "cold" in ds else None
+            if wv is not None and cv is not None:
+                w_arr = wv.isel(time=0).values if "time" in wv.dims else wv.values
+                c_arr = cv.isel(time=0).values if "time" in cv.dims else cv.values
+                w_arr = np.squeeze(np.asarray(w_arr))
+                c_arr = np.squeeze(np.asarray(c_arr))
+                if w_arr.ndim != 2 or c_arr.ndim != 2:
+                    h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                    warm = np.zeros((h, w), dtype=np.uint8)
+                    cold = np.zeros((h, w), dtype=np.uint8)
+                else:
+                    warm = (w_arr > 0.5).astype(np.uint8)
+                    cold = (c_arr > 0.5).astype(np.uint8)
+            else:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                warm = np.zeros((h, w), dtype=np.uint8)
+                cold = np.zeros((h, w), dtype=np.uint8)
+        return warm, cold
+    finally:
+        ds.close()
 
 def _load_stage2_5_junction(nc_path: str):
     """
@@ -97,11 +127,31 @@ def _load_stage2_5_junction(nc_path: str):
     try:
         if "junction" in ds:
             j = ds["junction"]
-            jmask = (j.isel(time=0).values if "time" in j.dims else j.values).astype(np.uint8)
+            arr = j.isel(time=0).values if "time" in j.dims else j.values
         else:
-            # class_map は warm/cold 用のため junction の代用にしない
-            h = ds.dims.get("lat", 0); w = ds.dims.get("lon", 0)
+            arr = None
+
+        if arr is None:
+            h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
             jmask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            a = np.asarray(arr)
+            if a.ndim == 3 and a.shape[0] == 1:
+                a = a[0]
+            a = np.squeeze(a)
+            if a.ndim != 2:
+                h = int(ds.sizes.get("lat", 0)); w = int(ds.sizes.get("lon", 0))
+                tmp = np.zeros((h, w), dtype=np.uint8)
+                try:
+                    hh = min(h, a.shape[-2] if a.ndim >= 2 else 0)
+                    ww = min(w, a.shape[-1] if a.ndim >= 2 else 0)
+                    if hh > 0 and ww > 0:
+                        tmp[:hh, :ww] = (a[..., :hh, :ww] > 0).astype(np.uint8)
+                except Exception:
+                    pass
+                jmask = tmp
+            else:
+                jmask = (a > 0).astype(np.uint8)
         return jmask
     finally:
         ds.close()

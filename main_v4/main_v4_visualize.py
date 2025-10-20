@@ -571,6 +571,8 @@ def _pred_class_map_for_stage(stage_name: str, nc_path: str):
                 arr = arr[0]
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
+            # ensure 2D shape aligned to (h,w)
+            arr = _align_to_hw(arr, h, w)
             pred = arr.astype(np.int64)
         else:
             pred = np.zeros((h, w), dtype=np.int64)
