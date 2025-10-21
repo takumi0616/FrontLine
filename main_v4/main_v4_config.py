@@ -61,7 +61,7 @@ MODEL_BASE = {
 
 CFG = {
     "SEED": 0,
-    "THREADS": 4,
+    "THREADS": 6,
     "PATHS": {
         "nc_gsm_dir": "./128_128/nc_gsm9",               # GSM（31変数×時刻）
         "nc_0p5_dir": "./128_128/nc_0p5_bulge_v2",       # 前線GT（5ch: warm/cold/stationary/occluded/warm_cold）
