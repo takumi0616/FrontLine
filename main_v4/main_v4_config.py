@@ -177,7 +177,8 @@ CFG = {
     # Stage3.5: 閉塞は温暖/寒冷/接合のいずれかに付着するもののみ残す
     "STAGE3_5": {
         "connectivity": 8,
-        "must_attach_to_any_of": ["warm", "cold", "junction"]
+        "must_attach_to_any_of": ["warm", "cold", "junction"],
+        "min_component_area": 4
     },
 
     # Stage4: 停滞 を二値（none/stationary）で学習。入力は GSM + 接合 + 温暖 + 寒冷 + 閉塞

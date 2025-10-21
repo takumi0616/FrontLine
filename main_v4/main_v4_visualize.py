@@ -763,4 +763,339 @@ def run_visualization_for_stage(stage_name: str):
     print(f"[v4-visualize] {stage_name} done in {format_time(time.time() - t0)}")
 
 
-__all__ = ["run_visualization_for_stage"]
+def run_visualization_final():
+    """
+    Final用の複合比較図を生成する。
+    各時刻ごとに以下9枚を1枚にまとめ、v4_result/visualizations/final へ保存する。
+      上段: stage1, stage1_5, stage2, stage2_5
+      中段: stage3, stage3_5, stage4, stage4_5
+      下段: 中央に Ground Truth（GT）
+    背景には海面更正気圧の偏差を重畳し、低気圧中心があれば赤×で表示する。
+    出力ファイル名: comparison_final_YYYYMMDDHHMM.png
+    """
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+
+    print_memory_usage("Start Visualization for final (9-up grid)")
+    t0 = time.time()
+
+    # final_out_dir の final_*.nc を基準に時刻列挙
+    if not os.path.exists(final_out_dir):
+        print(f"[v4-visualize] No final nc directory: {final_out_dir}")
+        return
+    files = [f for f in os.listdir(final_out_dir) if f.startswith("final_") and f.endswith(".nc")]
+    files = sorted(files)
+    if not files:
+        print(f"[v4-visualize] No files for final in: {final_out_dir}")
+        return
+
+    out_dir = os.path.join(output_visual_dir, "final")
+    os.makedirs(out_dir, exist_ok=True)
+
+    for f in files:
+        token = f.replace("final_", "").replace(".nc", "")
+        time_dt = pd.to_datetime(token, format="%Y%m%d%H%M")
+
+        # 各ステージの予測class_mapを取得
+        stages_row1 = ["stage1", "stage1_5", "stage2", "stage2_5"]
+        stages_row2 = ["stage3", "stage3_5", "stage4", "stage4_5"]
+        titles_row1 = ["Stage1", "Stage1.5", "Stage2", "Stage2.5"]
+        titles_row2 = ["Stage3", "Stage3.5", "Stage4", "Stage4.5"]
+
+        # まず final のファイルが壊れていても座標を確実に取得できるよう lat/lon を最初に決める
+        # stage4_5 か final の座標を優先に、ダメなら GSM で補完
+        try:
+            pred_dummy, lat, lon, _ = _pred_class_map_for_stage("stage4_5", os.path.join(final_out_dir, f))
+        except Exception:
+            lat, lon = _get_gsm_lat_lon(time_dt)
+            if lat is None or lon is None:
+                print(f"[v4-visualize] Could not determine lat/lon for {token}")
+                continue
+
+        # 各ステージの予測を取得（座標整合も内部で実施）
+        pred_maps = []
+        for st in stages_row1 + stages_row2:
+            try:
+                # 対象ステージの .nc path を導出
+                if st == "stage1":
+                    nc_dir, prefix = stage1_out_dir, "prob_"
+                elif st == "stage1_5":
+                    nc_dir, prefix = stage1_5_out_dir, "junction_"
+                elif st == "stage2":
+                    nc_dir, prefix = stage2_out_dir, "prob_"
+                elif st == "stage2_5":
+                    nc_dir, prefix = stage2_5_out_dir, "refined_"
+                elif st == "stage3":
+                    nc_dir, prefix = stage3_out_dir, "prob_"
+                elif st == "stage3_5":
+                    nc_dir, prefix = stage3_5_out_dir, "occluded_"
+                elif st == "stage4":
+                    nc_dir, prefix = stage4_out_dir, "prob_"
+                elif st == "stage4_5":
+                    nc_dir, prefix = final_out_dir, "final_"
+                else:
+                    nc_dir, prefix = None, None
+                if (nc_dir is None) or (not os.path.exists(os.path.join(nc_dir, f"{prefix}{token}.nc"))):
+                    pred_maps.append(None)
+                    continue
+                pred_cm, plat, plon, _ = _pred_class_map_for_stage(st, os.path.join(nc_dir, f"{prefix}{token}.nc"))
+                # 予測に合わせて座標を正規化
+                H, W = pred_cm.shape
+                nlat, nlon = _normalize_lat_lon(plat, plon, H, W, time_dt)
+                pred_maps.append((pred_cm, nlat, nlon))
+            except Exception as e:
+                print(f"[v4-visualize] Failed to read stage {st} for {token}: {e}")
+                pred_maps.append(None)
+
+        # GT class map
+        # pred_mapsに含まれる最初の有効な座標に合わせる
+        ref = next((x for x in pred_maps if x is not None), None)
+        if ref is None:
+            # 何も描けない
+            print(f"[v4-visualize] No valid predictions for {token}")
+            continue
+        _, plat, plon = ref
+        gt_cm = _gt_class_map_for_time(time_dt, plat, plon)
+
+        # 背景の気圧偏差・低気圧中心
+        pdev, low_mask, low_exists = _load_pressure_and_lowcenter(token[:6], time_dt)
+
+        # 描画
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        class_colors = CFG["VISUALIZATION"]["class_colors"]
+        cmap = mcolors.ListedColormap([class_colors[i] for i in sorted(class_colors.keys())])
+        bounds = np.arange(len(class_colors) + 1) - 0.5
+        norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+        pressure_vmin = CFG["VISUALIZATION"]["pressure_vmin"]
+        pressure_vmax = CFG["VISUALIZATION"]["pressure_vmax"]
+        pressure_levels = np.linspace(pressure_vmin, pressure_vmax, CFG["VISUALIZATION"]["pressure_levels"])
+        pressure_norm = mcolors.Normalize(vmin=pressure_vmin, vmax=pressure_vmax)
+        cmap_pressure = plt.get_cmap("RdBu_r")
+
+        fig = plt.figure(figsize=(16, 12))
+        from matplotlib import gridspec
+        gs = gridspec.GridSpec(3, 4, height_ratios=[1, 1, 1], wspace=0.1, hspace=0.15)
+
+        axes = []
+        # 上段4枚
+        for i in range(4):
+            ax = plt.subplot(gs[0, i], projection=ccrs.PlateCarree())
+            axes.append(ax)
+        # 中段4枚
+        for i in range(4):
+            ax = plt.subplot(gs[1, i], projection=ccrs.PlateCarree())
+            axes.append(ax)
+        # 下段は中央（列1〜2）にGT
+        ax_gt = plt.subplot(gs[2, 1:3], projection=ccrs.PlateCarree())
+
+        # 描画用 extent
+        lat_ref, lon_ref = plat, plon
+        lon_min, lon_max = float(np.min(lon_ref)), float(np.max(lon_ref))
+        lat_min, lat_max = float(np.min(lat_ref)), float(np.max(lat_ref))
+        if lon_min == lon_max: lon_max = lon_min + 1e-6
+        if lat_min == lat_max: lat_max = lat_min + 1e-6
+        extent = [lon_min, lon_max, lat_min, lat_max]
+
+        # 背景描画 + 前線予測の重畳
+        def draw_panel(ax, pred_info, title):
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="black")
+            ax.add_feature(cfeature.BORDERS.with_scale("10m"), linestyle=":")
+            ax.add_feature(cfeature.LAKES.with_scale("10m"), alpha=0.5)
+            ax.add_feature(cfeature.RIVERS.with_scale("10m"))
+            gl = ax.gridlines(draw_labels=True, linewidth=0.5, color="gray", linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+            ax.tick_params(labelsize=8)
+
+            # 背景
+            if pdev is not None and isinstance(pdev, np.ndarray):
+                lon_grid, lat_grid = np.meshgrid(lon_ref, lat_ref)
+                ax.contourf(
+                    lon_grid, lat_grid, pdev,
+                    levels=pressure_levels, cmap=cmap_pressure, extend="both",
+                    norm=pressure_norm, transform=ccrs.PlateCarree(), zorder=0
+                )
+                ax.contour(
+                    lon_grid, lat_grid, pdev,
+                    levels=pressure_levels, colors="black", linestyles="--", linewidths=1.0,
+                    transform=ccrs.PlateCarree(), zorder=1
+                )
+            # 予測
+            if pred_info is not None:
+                pred_cm, plat_i, plon_i = pred_info
+                # 念のため座標整合
+                H, W = pred_cm.shape
+                plat_i, plon_i = _normalize_lat_lon(plat_i, plon_i, H, W, time_dt)
+                lon_grid, lat_grid = np.meshgrid(plon_i, plat_i)
+                ax.pcolormesh(
+                    lon_grid, lat_grid, pred_cm,
+                    cmap=cmap, norm=norm, transform=ccrs.PlateCarree(),
+                    alpha=0.6, zorder=2
+                )
+            # 低気圧中心
+            if pdev is not None and low_exists and (low_mask is not None) and (low_mask.shape == (len(lat_ref), len(lon_ref))):
+                y_idx, x_idx = np.where(low_mask)
+                low_lats = lat_ref[y_idx]
+                low_lons = lon_ref[x_idx]
+                ax.plot(low_lons, low_lats, "rx", markersize=6, markeredgewidth=1.5, zorder=6)
+
+            ax.set_title(title)
+
+        # 上段4, 中段4
+        for i, ax in enumerate(axes[:4]):
+            draw_panel(ax, pred_maps[i], titles_row1[i] + f"\n{token}")
+        for j, ax in enumerate(axes[4:8]):
+            draw_panel(ax, pred_maps[4 + j], titles_row2[j] + f"\n{token}")
+
+        # 下段GT
+        def draw_gt(ax):
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="black")
+            ax.add_feature(cfeature.BORDERS.with_scale("10m"), linestyle=":")
+            ax.add_feature(cfeature.LAKES.with_scale("10m"), alpha=0.5)
+            ax.add_feature(cfeature.RIVERS.with_scale("10m"))
+            gl = ax.gridlines(draw_labels=True, linewidth=0.5, color="gray", linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+            ax.tick_params(labelsize=8)
+            lon_grid, lat_grid = np.meshgrid(lon_ref, lat_ref)
+            if pdev is not None and isinstance(pdev, np.ndarray):
+                ax.contourf(
+                    lon_grid, lat_grid, pdev,
+                    levels=pressure_levels, cmap=cmap_pressure, extend="both",
+                    norm=pressure_norm, transform=ccrs.PlateCarree(), zorder=0
+                )
+                ax.contour(
+                    lon_grid, lat_grid, pdev,
+                    levels=pressure_levels, colors="black", linestyles="--", linewidths=1.0,
+                    transform=ccrs.PlateCarree(), zorder=1
+                )
+            ax.pcolormesh(
+                lon_grid, lat_grid, gt_cm,
+                cmap=cmap, norm=norm, transform=ccrs.PlateCarree(),
+                alpha=0.6, zorder=2
+            )
+            if pdev is not None and low_exists and (low_mask is not None) and (low_mask.shape == (len(lat_ref), len(lon_ref))):
+                y_idx, x_idx = np.where(low_mask)
+                low_lats = lat_ref[y_idx]
+                low_lons = lon_ref[x_idx]
+                ax.plot(low_lons, low_lats, "rx", markersize=6, markeredgewidth=1.5, zorder=6)
+            ax.set_title(f"Ground Truth\n{token}")
+
+        draw_gt(ax_gt)
+
+        save_path = os.path.join(out_dir, f"comparison_final_{token}.png")
+        try:
+            plt.savefig(save_path, dpi=220, bbox_inches="tight")
+        except Exception as e:
+            print(f"[v4-visualize] Save failed: {save_path}: {e}")
+        plt.close()
+        gc.collect()
+
+    print_memory_usage("After Visualization for final (9-up grid)")
+    print(f"[v4-visualize] final grid done in {format_time(time.time() - t0)}")
+
+
+def create_lowres_videos_for_all_stages():
+    """
+    可視化フォルダごとに低解像度の通年動画(YYYY=CFG['EVAL']['year'])を1本ずつ作成する。
+    出力ファイル:
+      - stage1    -> v4_result/visualizations/stage_1_comparison_{year}_full_year_low.mp4
+      - stage1_5  -> v4_result/visualizations/stage_1_5_comparison_{year}_full_year_low.mp4
+      - stage2    -> v4_result/visualizations/stage_2_comparison_{year}_full_year_low.mp4
+      - stage2_5  -> v4_result/visualizations/stage_2_5_comparison_{year}_full_year_low.mp4
+      - stage3    -> v4_result/visualizations/stage_3_comparison_{year}_full_year_low.mp4
+      - stage3_5  -> v4_result/visualizations/stage_3_5_comparison_{year}_full_year_low.mp4
+      - stage4    -> v4_result/visualizations/stage_4_comparison_{year}_full_year_low.mp4
+      - stage4_5  -> v4_result/visualizations/stage_4_5_comparison_{year}_full_year_low.mp4
+      - final     -> v4_result/visualizations/final_comparison_{year}_full_year_low.mp4
+    """
+    import glob
+    import cv2
+    import tempfile
+    import subprocess
+    import shutil
+
+    def _sorted_images(folder: str):
+        files = glob.glob(os.path.join(folder, "comparison_*.png"))
+        # ソートキーは末尾の時刻トークン
+        def _key(p):
+            base = os.path.basename(p).replace(".png", "")
+            # token = 最後の "_" の右側
+            token = base.rsplit("_", 1)[-1]
+            return token
+        files.sort(key=_key)
+        return files
+
+    def _make_lowres_video(image_folder: str, output_path_low: str, low_res_scale: int = 3, low_res_frame_rate: int = 10):
+        imgs = _sorted_images(image_folder)
+        if not imgs:
+            print(f"[video] No images in {image_folder}, skip")
+            return
+        frame0 = cv2.imread(imgs[0])
+        if frame0 is None:
+            print(f"[video] Failed to read first image: {imgs[0]}")
+            return
+        h, w = frame0.shape[:2]
+        low_w = max(2, (w // low_res_scale) // 2 * 2)
+        low_h = max(2, (h // low_res_scale) // 2 * 2)
+
+        tmpdir = tempfile.mkdtemp(prefix="v4vis_")
+        try:
+            for i, p in enumerate(imgs):
+                img = cv2.imread(p)
+                if img is None:
+                    continue
+                img_small = cv2.resize(img, (low_w, low_h))
+                cv2.imwrite(os.path.join(tmpdir, f"frame_{i:06d}.png"), img_small)
+            # ffmpeg で連結（yuv420p/padで非偶数回避）
+            cmd = [
+                "ffmpeg", "-y",
+                "-r", str(low_res_frame_rate),
+                "-i", os.path.join(tmpdir, "frame_%06d.png"),
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-vcodec", "libx264",
+                "-crf", "30",
+                "-preset", "veryfast",
+                "-pix_fmt", "yuv420p",
+                output_path_low,
+            ]
+            try:
+                subprocess.run(cmd, check=False)
+                print(f"[video] Wrote low-res video: {output_path_low}")
+            except Exception as e:
+                print(f"[video] ffmpeg failed: {e}")
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    year = CFG.get("EVAL", {}).get("year", 2023)
+    out_root = output_visual_dir
+
+    plans = [
+        ("stage1",   os.path.join(out_root, "stage1"),   os.path.join(out_root, f"stage_1_comparison_{year}_full_year_low.mp4")),
+        ("stage1_5", os.path.join(out_root, "stage1_5"), os.path.join(out_root, f"stage_1_5_comparison_{year}_full_year_low.mp4")),
+        ("stage2",   os.path.join(out_root, "stage2"),   os.path.join(out_root, f"stage_2_comparison_{year}_full_year_low.mp4")),
+        ("stage2_5", os.path.join(out_root, "stage2_5"), os.path.join(out_root, f"stage_2_5_comparison_{year}_full_year_low.mp4")),
+        ("stage3",   os.path.join(out_root, "stage3"),   os.path.join(out_root, f"stage_3_comparison_{year}_full_year_low.mp4")),
+        ("stage3_5", os.path.join(out_root, "stage3_5"), os.path.join(out_root, f"stage_3_5_comparison_{year}_full_year_low.mp4")),
+        ("stage4",   os.path.join(out_root, "stage4"),   os.path.join(out_root, f"stage_4_comparison_{year}_full_year_low.mp4")),
+        ("stage4_5", os.path.join(out_root, "stage4_5"), os.path.join(out_root, f"stage_4_5_comparison_{year}_full_year_low.mp4")),
+        ("final",    os.path.join(out_root, "final"),    os.path.join(out_root, f"final_comparison_{year}_full_year_low.mp4")),
+    ]
+
+    for tag, img_dir, out_path in plans:
+        if not os.path.exists(img_dir):
+            print(f"[video] image dir not found for {tag}: {img_dir}, skip")
+            continue
+        _make_lowres_video(img_dir, out_path)
+
+    print("[video] All requested low-res videos processed.")
+
+
+__all__ = ["run_visualization_for_stage", "run_visualization_final", "create_lowres_videos_for_all_stages"]

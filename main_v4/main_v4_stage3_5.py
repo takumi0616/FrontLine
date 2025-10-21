@@ -156,9 +156,9 @@ def _load_stage2_5_junction(nc_path: str):
     finally:
         ds.close()
 
-def _filter_occluded_by_attachment(occ: np.ndarray, warm: np.ndarray, cold: np.ndarray, junc: np.ndarray, connectivity: int = 8) -> np.ndarray:
+def _filter_occluded_by_attachment(occ: np.ndarray, warm: np.ndarray, cold: np.ndarray, junc: np.ndarray, connectivity: int = 8, min_area: int = 1) -> np.ndarray:
     """
-    occluded 成分が warm/cold/junc のどれかに接していれば保持、そうでなければ除去
+    occluded 成分が warm/cold/junc のどれかに接しており、かつ面積が min_area 以上のもののみ保持（それ以外は除去）
     """
     from skimage.measure import label, regionprops
     import cv2
@@ -177,11 +177,12 @@ def _filter_occluded_by_attachment(occ: np.ndarray, warm: np.ndarray, cold: np.n
         coords = reg.coords
         ys = coords[:, 0]; xs = coords[:, 1]
         touch = (warm_d[ys, xs] > 0).any() or (cold_d[ys, xs] > 0).any() or (junc_d[ys, xs] > 0).any()
-        if touch:
+        area = len(coords)
+        if (area >= min_area) and touch:
             out[ys, xs] = 1
     return out
 
-def process_one_time(s3_prob_path: str, s2_5_path: str, s1_5_path: str, out_dir: str, connectivity: int):
+def process_one_time(s3_prob_path: str, s2_5_path: str, s1_5_path: str, out_dir: str, connectivity: int, min_area: int):
     """
     関数概要:
       単一時刻について、Stage3 の確率出力（none/occluded）と Stage2.5 の warm/cold/junction を用い、
@@ -214,7 +215,7 @@ def process_one_time(s3_prob_path: str, s2_5_path: str, s1_5_path: str, out_dir:
     occ = occ[:H, :W]; warm = warm[:H, :W]; cold = cold[:H, :W]; junc = junc[:H, :W]
     lat = lat[:H]; lon = lon[:W]
 
-    occ_ref = _filter_occluded_by_attachment(occ, warm, cold, junc, connectivity=connectivity)
+    occ_ref = _filter_occluded_by_attachment(occ, warm, cold, junc, connectivity=connectivity, min_area=min_area)
 
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"occluded_{t_dt.strftime('%Y%m%d%H%M')}.nc")
@@ -261,10 +262,11 @@ def run_stage3_5():
         return
 
     connectivity = CFG["STAGE3_5"]["connectivity"]
+    min_area = CFG["STAGE3_5"].get("min_component_area", 1)
 
     for k in keys:
         # junction も Stage2.5 refined_* 内の "junction" を用いる（第3引数にも map2[k] を渡す）
-        process_one_time(map3[k], map2[k], map2[k], stage3_5_out_dir, connectivity=connectivity)
+        process_one_time(map3[k], map2[k], map2[k], stage3_5_out_dir, connectivity=connectivity, min_area=min_area)
 
     print_memory_usage("After V4 Stage3.5")
     print(f"[V4-Stage3.5] done in {format_time(time.time() - t0)}")

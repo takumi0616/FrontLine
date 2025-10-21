@@ -44,7 +44,7 @@ from main_v4.main_v4_stage3 import run_stage3
 from main_v4.main_v4_stage3_5 import run_stage3_5
 from main_v4.main_v4_stage4 import run_stage4
 from main_v4.main_v4_stage4_5 import run_stage4_5
-from main_v4.main_v4_visualize import run_visualization_for_stage
+from main_v4.main_v4_visualize import run_visualization_for_stage, run_visualization_final, create_lowres_videos_for_all_stages
 
 
 def main():
@@ -123,6 +123,16 @@ def main():
     run_stage4_5()
     print(f"[main_v4] Stage4.5: {format_time(time.time() - t)}")
     run_visualization_for_stage("stage4_5")
+
+    # Final 9-up visualization (stage1..stage4_5 + GT)
+    t = time.time()
+    run_visualization_final()
+    print(f"[main_v4] Final(9-up): {format_time(time.time() - t)}")
+
+    # Create low-res videos for all visualization folders
+    t = time.time()
+    create_lowres_videos_for_all_stages()
+    print(f"[main_v4] Videos(low-res): {format_time(time.time() - t)}")
 
     print_memory_usage("End main_v4")
     print(f"[main_v4] Total: {format_time(time.time() - total_start)}")
