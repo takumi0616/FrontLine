@@ -92,7 +92,7 @@ CFG = {
     "STAGE1": {
         "num_classes": 6,           # 0:none, 1:warm, 2:cold, 3:stationary, 4:occluded, 5:junction
         "in_chans": 93,             # GSM 31変数×(t-6,t,t+6)
-        "epochs": 50,
+        "epochs": 100,
         "train_months": (2014, 1, 2022, 12),
         "test_months": (2023, 1, 2023, 12),
         "dataset_cache_size": 50,
@@ -125,7 +125,7 @@ CFG = {
     "STAGE2": {
         "num_classes": 3,           # 0:none, 1:warm, 2:cold
         "in_chans": 94,             # 93 (GSM) + 1 (junction mask)
-        "epochs": 50,
+        "epochs": 100,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,
@@ -155,7 +155,7 @@ CFG = {
     "STAGE3": {
         "num_classes": 2,           # 0:none, 1:occluded
         "in_chans": 96,             # 93 + 1(junc) + 1(warm) + 1(cold)
-        "epochs": 50,
+        "epochs": 100,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,
@@ -185,7 +185,7 @@ CFG = {
     "STAGE4": {
         "num_classes": 2,           # 0:none, 1:stationary
         "in_chans": 97,             # 93 + 1(junc) + 1(warm) + 1(cold) + 1(occluded)
-        "epochs": 50,
+        "epochs": 100,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,
