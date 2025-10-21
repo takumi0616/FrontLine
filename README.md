@@ -21,6 +21,10 @@ notify-run wsl-ubuntu -- nohup python main_v3.py > output_v3.log 2>&1 &
 
 notify-run wsl-ubuntu -- nohup python main_v4.py > output_v4.log 2>&1 &
 
+notify-run gpu01 -- nohup python main_v4.py > output_v4.log 2>&1 &
+
+notify-run gpu02 -- nohup python main_v4.py > output_v4.log 2>&1 &
+
 notify-run gpu02 -- nohup python main_v3.py > output_v3.log 2>&1 &
 ```
 
