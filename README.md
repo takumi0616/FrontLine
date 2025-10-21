@@ -41,13 +41,13 @@ sudo chown -R takumi:takumi /home/takumi/docker_miniconda/src/FrontLine/
 gpu02 → mac
 
 ```bash
-rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/FrontLine/v3_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_gpu02
+rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/FrontLine/v4_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_gpu02
 ```
 
 wsl-ubuntu → mac
 
 ```bash
-rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/FrontLine/v31_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_wsl-ubuntu
+rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/FrontLine/v4_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_wsl-ubuntu
 ```
 
 ---
