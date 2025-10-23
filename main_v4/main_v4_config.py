@@ -41,17 +41,17 @@ sys.path.append(str(Path(__file__).parent.resolve()))
 MODEL_BASE = {
     "img_size": 128,
     "patch_size": 2,
-    "embed_dim": 192,
+    "embed_dim": 256,
     "depths": [2, 2, 2, 2],
     "depths_decoder": [1, 2, 2, 2],
-    "num_heads": [3, 6, 12, 24],
+    "num_heads": [4, 8, 16, 32],
     "window_size": 16,
     "mlp_ratio": 4.0,
     "qkv_bias": True,
     "qk_scale": None,
     "drop_rate": 0.0,
     "attn_drop_rate": 0.0,
-    "drop_path_rate": 0.1,
+    "drop_path_rate": 0.2,
     "norm_layer": nn.LayerNorm,
     "ape": False,
     "patch_norm": True,
@@ -92,7 +92,7 @@ CFG = {
     "STAGE1": {
         "num_classes": 6,           # 0:none, 1:warm, 2:cold, 3:stationary, 4:occluded, 5:junction
         "in_chans": 93,             # GSM 31変数×(t-6,t,t+6)
-        "epochs": 100,
+        "epochs": 2,
         "train_months": (2014, 1, 2022, 12),
         "test_months": (2023, 1, 2023, 12),
         "dataset_cache_size": 50,
@@ -125,7 +125,7 @@ CFG = {
     "STAGE2": {
         "num_classes": 3,           # 0:none, 1:warm, 2:cold
         "in_chans": 94,             # 93 (GSM) + 1 (junction mask)
-        "epochs": 100,
+        "epochs": 2,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,
@@ -155,7 +155,7 @@ CFG = {
     "STAGE3": {
         "num_classes": 2,           # 0:none, 1:occluded
         "in_chans": 96,             # 93 + 1(junc) + 1(warm) + 1(cold)
-        "epochs": 100,
+        "epochs": 2,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,
@@ -185,7 +185,7 @@ CFG = {
     "STAGE4": {
         "num_classes": 2,           # 0:none, 1:stationary
         "in_chans": 97,             # 93 + 1(junc) + 1(warm) + 1(cold) + 1(occluded)
-        "epochs": 100,
+        "epochs": 2,
         "train_months": (2014, 1, 2022, 12),
         "dataset_cache_size": 50,
         "file_cache_size": 10,

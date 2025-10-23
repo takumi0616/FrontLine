@@ -45,6 +45,7 @@ from main_v4.main_v4_stage3_5 import run_stage3_5
 from main_v4.main_v4_stage4 import run_stage4
 from main_v4.main_v4_stage4_5 import run_stage4_5
 from main_v4.main_v4_visualize import run_visualization_for_stage, run_visualization_final, create_lowres_videos_for_all_stages
+from main_v4.main_v4_evaluation import run_evaluation_v4
 
 
 def main():
@@ -128,6 +129,11 @@ def main():
     t = time.time()
     run_visualization_final()
     print(f"[main_v4] Final(9-up): {format_time(time.time() - t)}")
+
+    # Evaluation (v4)
+    t = time.time()
+    run_evaluation_v4()
+    print(f"[main_v4] Evaluation: {format_time(time.time() - t)}")
 
     # Create low-res videos for all visualization folders
     t = time.time()

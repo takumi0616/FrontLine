@@ -797,10 +797,39 @@ def run_visualization_final():
         time_dt = pd.to_datetime(token, format="%Y%m%d%H%M")
 
         # 各ステージの予測class_mapを取得
-        stages_row1 = ["stage1", "stage1_5", "stage2", "stage2_5"]
-        stages_row2 = ["stage3", "stage3_5", "stage4", "stage4_5"]
-        titles_row1 = ["Stage1", "Stage1.5", "Stage2", "Stage2.5"]
-        titles_row2 = ["Stage3", "Stage3.5", "Stage4", "Stage4.5"]
+        stages_top = ["stage1", "stage1_5", "stage2", "stage2_5"]
+        stages_mid = ["stage3", "stage3_5", "stage4"]
+        titles_top = ["Stage1", "Stage1.5", "Stage2", "Stage2.5"]
+        titles_mid = ["Stage3", "Stage3.5", "Stage4"]
+
+        # 各ステージの予測class_mapを取得（辞書に格納）
+        pred_by_stage = {}
+        def _stage_nc_dir_and_prefix(st: str):
+            if st == "stage1":   return stage1_out_dir, "prob_"
+            if st == "stage1_5": return stage1_5_out_dir, "junction_"
+            if st == "stage2":   return stage2_out_dir, "prob_"
+            if st == "stage2_5": return stage2_5_out_dir, "refined_"
+            if st == "stage3":   return stage3_out_dir, "prob_"
+            if st == "stage3_5": return stage3_5_out_dir, "occluded_"
+            if st == "stage4":   return stage4_out_dir, "prob_"
+            if st == "stage4_5": return final_out_dir, "final_"
+            return None, None
+
+        stages_all = stages_top + stages_mid + ["stage4_5"]
+        for st in stages_all:
+            nc_dir, prefix = _stage_nc_dir_and_prefix(st)
+            if (nc_dir is None) or (not os.path.exists(os.path.join(nc_dir, f"{prefix}{token}.nc"))):
+                pred_by_stage[st] = None
+                continue
+            try:
+                pred_cm, plat, plon, _ = _pred_class_map_for_stage(st, os.path.join(nc_dir, f"{prefix}{token}.nc"))
+                # 予測に合わせて座標を正規化
+                H, W = pred_cm.shape
+                nlat, nlon = _normalize_lat_lon(plat, plon, H, W, time_dt)
+                pred_by_stage[st] = (pred_cm, nlat, nlon)
+            except Exception as e:
+                print(f"[v4-visualize] Failed to read stage {st} for {token}: {e}")
+                pred_by_stage[st] = None
 
         # まず final のファイルが壊れていても座標を確実に取得できるよう lat/lon を最初に決める
         # stage4_5 か final の座標を優先に、ダメなら GSM で補完
@@ -812,40 +841,8 @@ def run_visualization_final():
                 print(f"[v4-visualize] Could not determine lat/lon for {token}")
                 continue
 
-        # 各ステージの予測を取得（座標整合も内部で実施）
-        pred_maps = []
-        for st in stages_row1 + stages_row2:
-            try:
-                # 対象ステージの .nc path を導出
-                if st == "stage1":
-                    nc_dir, prefix = stage1_out_dir, "prob_"
-                elif st == "stage1_5":
-                    nc_dir, prefix = stage1_5_out_dir, "junction_"
-                elif st == "stage2":
-                    nc_dir, prefix = stage2_out_dir, "prob_"
-                elif st == "stage2_5":
-                    nc_dir, prefix = stage2_5_out_dir, "refined_"
-                elif st == "stage3":
-                    nc_dir, prefix = stage3_out_dir, "prob_"
-                elif st == "stage3_5":
-                    nc_dir, prefix = stage3_5_out_dir, "occluded_"
-                elif st == "stage4":
-                    nc_dir, prefix = stage4_out_dir, "prob_"
-                elif st == "stage4_5":
-                    nc_dir, prefix = final_out_dir, "final_"
-                else:
-                    nc_dir, prefix = None, None
-                if (nc_dir is None) or (not os.path.exists(os.path.join(nc_dir, f"{prefix}{token}.nc"))):
-                    pred_maps.append(None)
-                    continue
-                pred_cm, plat, plon, _ = _pred_class_map_for_stage(st, os.path.join(nc_dir, f"{prefix}{token}.nc"))
-                # 予測に合わせて座標を正規化
-                H, W = pred_cm.shape
-                nlat, nlon = _normalize_lat_lon(plat, plon, H, W, time_dt)
-                pred_maps.append((pred_cm, nlat, nlon))
-            except Exception as e:
-                print(f"[v4-visualize] Failed to read stage {st} for {token}: {e}")
-                pred_maps.append(None)
+        # 参照座標決定用の候補（すでに pred_by_stage を構築済みのためそれを利用）
+        pred_maps = [pred_by_stage.get(st, None) for st in (stages_top + stages_mid + ["stage4_5"])]
 
         # GT class map
         # pred_mapsに含まれる最初の有効な座標に合わせる
@@ -878,17 +875,13 @@ def run_visualization_final():
         from matplotlib import gridspec
         gs = gridspec.GridSpec(3, 4, height_ratios=[1, 1, 1], wspace=0.1, hspace=0.15)
 
-        axes = []
-        # 上段4枚
-        for i in range(4):
-            ax = plt.subplot(gs[0, i], projection=ccrs.PlateCarree())
-            axes.append(ax)
-        # 中段4枚
-        for i in range(4):
-            ax = plt.subplot(gs[1, i], projection=ccrs.PlateCarree())
-            axes.append(ax)
-        # 下段は中央（列1〜2）にGT
-        ax_gt = plt.subplot(gs[2, 1:3], projection=ccrs.PlateCarree())
+        # 上段: 4枚
+        axes_top = [plt.subplot(gs[0, i], projection=ccrs.PlateCarree()) for i in range(4)]
+        # 中段: 3枚（右端1列は未使用）
+        axes_mid = [plt.subplot(gs[1, i], projection=ccrs.PlateCarree()) for i in range(3)]
+        # 下段: 左に Stage4.5（2列幅）、右に GT（2列幅）
+        ax_bottom_left = plt.subplot(gs[2, 0:2], projection=ccrs.PlateCarree())
+        ax_bottom_right = plt.subplot(gs[2, 2:4], projection=ccrs.PlateCarree())
 
         # 描画用 extent
         lat_ref, lon_ref = plat, plon
@@ -944,13 +937,15 @@ def run_visualization_final():
 
             ax.set_title(title)
 
-        # 上段4, 中段4
-        for i, ax in enumerate(axes[:4]):
-            draw_panel(ax, pred_maps[i], titles_row1[i] + f"\n{token}")
-        for j, ax in enumerate(axes[4:8]):
-            draw_panel(ax, pred_maps[4 + j], titles_row2[j] + f"\n{token}")
+        # 上段4, 中段3
+        for i, ax in enumerate(axes_top):
+            draw_panel(ax, pred_by_stage.get(stages_top[i], None), titles_top[i] + f"\n{token}")
+        for j, ax in enumerate(axes_mid):
+            draw_panel(ax, pred_by_stage.get(stages_mid[j], None), titles_mid[j] + f"\n{token}")
 
-        # 下段GT
+        # 下段 左: Stage4.5, 右: GT
+        draw_panel(ax_bottom_left, pred_by_stage.get("stage4_5", None), "Stage4.5\n" + token)
+
         def draw_gt(ax):
             ax.set_extent(extent, crs=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="black")
@@ -985,7 +980,7 @@ def run_visualization_final():
                 ax.plot(low_lons, low_lats, "rx", markersize=6, markeredgewidth=1.5, zorder=6)
             ax.set_title(f"Ground Truth\n{token}")
 
-        draw_gt(ax_gt)
+        draw_gt(ax_bottom_right)
 
         save_path = os.path.join(out_dir, f"comparison_final_{token}.png")
         try:
@@ -1030,7 +1025,7 @@ def create_lowres_videos_for_all_stages():
         files.sort(key=_key)
         return files
 
-    def _make_lowres_video(image_folder: str, output_path_low: str, low_res_scale: int = 3, low_res_frame_rate: int = 10):
+    def _make_lowres_video(image_folder: str, output_path_low: str, low_res_scale: int = 3, low_res_frame_rate: int = 1):
         imgs = _sorted_images(image_folder)
         if not imgs:
             print(f"[video] No images in {image_folder}, skip")

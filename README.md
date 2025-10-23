@@ -48,6 +48,12 @@ gpu02 → mac
 rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/FrontLine/v4_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_gpu02
 ```
 
+gpu01 → mac
+
+```bash
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/FrontLine/v4_result /Users/takumi0616/Develop/docker_miniconda/src/FrontLine/result_gpu01
+```
+
 wsl-ubuntu → mac
 
 ```bash

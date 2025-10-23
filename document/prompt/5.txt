@@ -1,4 +1,4 @@
-src/FrontLine/document/paper
+@/src/FrontLine/document/paper
 
 上記の論文をそれぞれ読んでください
 おんなじ名前でmdファイルで論文の内容を詳細に解説した日本語のファイルを同じディレクトリ上に作成してください（もうすでにある場合は処理を行わなくていいです）
