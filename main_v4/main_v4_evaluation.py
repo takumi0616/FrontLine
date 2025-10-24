@@ -365,7 +365,11 @@ def _reduce_gt_for_stage(stage: str, gt_cm: np.ndarray) -> np.ndarray:
         out[gt_cm == 4] = 4
         out[gt_cm == 5] = 5
     elif stage == "stage3_5":
+        # stage3_5 も warm/cold/junction/occluded を評価（0/1/2/4/5）
+        out[gt_cm == 1] = 1
+        out[gt_cm == 2] = 2
         out[gt_cm == 4] = 4
+        out[gt_cm == 5] = 5
     elif stage in ["stage4", "stage4_5"]:
         for c in [1, 2, 3, 4, 5]:
             out[gt_cm == c] = c
@@ -751,12 +755,14 @@ def _compute_presence_match_stage4_5(year: int, out_csv: str):
     - present_pred: 予測に出現したクラスの集合（1..5）
     - present_gt  : 正解に出現したクラスの集合（1..5）
     - match (0/1) : present_pred == present_gt のとき 1
+    戻り値: (match_count, total, percent[%])
     """
     tokens = _list_tokens_for_stage("stage4_5", year)
     if not tokens:
         print("[Presence] No final tokens for stage4_5 to compute presence match.")
-        return
+        return 0, 0, 0.0
     rows = []
+    match_count = 0
     for token in tokens:
         pred = _read_stage_pred("stage4_5", token)
         if pred is None:
@@ -768,12 +774,15 @@ def _compute_presence_match_stage4_5(year: int, out_csv: str):
         sp = sorted(set(int(c) for c in np.unique(pred) if (c >= 1 and c <= 5)))
         sg = sorted(set(int(c) for c in np.unique(gt) if (c >= 1 and c <= 5)))
         match = int(set(sp) == set(sg))
+        match_count += match
         rows.append({
             "time": pd.to_datetime(token, format="%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M"),
             "match": match,
             "present_pred": ",".join(map(str, sp)),
             "present_gt": ",".join(map(str, sg)),
         })
+    total = len(rows)
+    percent = (match_count / total * 100.0) if total > 0 else 0.0
     try:
         df = pd.DataFrame(rows)
         os.makedirs(os.path.dirname(out_csv), exist_ok=True)
@@ -781,6 +790,7 @@ def _compute_presence_match_stage4_5(year: int, out_csv: str):
         print(f"[Presence] stage4_5 presence match -> {out_csv}")
     except Exception as e:
         print(f"[Presence] write csv failed: {e}")
+    return match_count, total, percent
 
 
 def run_evaluation_v4():
@@ -863,12 +873,13 @@ def run_evaluation_v4():
     except Exception as e:
         print(f"[Eval] distance failed: {e}")
     try:
-        _compute_presence_match_stage4_5(
+        presence_match, presence_total, presence_pct = _compute_presence_match_stage4_5(
             year=year,
             out_csv=os.path.join(out_root, "stage4_5_presence_match.csv"),
         )
     except Exception as e:
         print(f"[Eval] presence failed: {e}")
+        presence_match, presence_total, presence_pct = 0, 0, 0.0
 
     # LOG（0-5 全クラス）
     try:
@@ -892,6 +903,8 @@ def run_evaluation_v4():
             f.write(f"  Seasonal Monthly CSV: {os.path.join(out_root, 'seasonal_monthly_rates.csv')}\n")
             f.write(f"  Seasonal CSV: {os.path.join(out_root, 'seasonal_rates.csv')}\n")
             f.write(f"  Distance CSV: {os.path.join(out_root, 'distance_stats.csv')}\n")
+            if 'presence_total' in locals() and presence_total and presence_total > 0:
+                f.write(f"  Presence match (stage4_5): {presence_pct:.2f}% ({presence_match}/{presence_total})\n")
         print(f"[Eval] summary log -> {log_path}")
     except Exception as e:
         print(f"[Eval] summary log failed: {e}")
@@ -917,6 +930,13 @@ def run_evaluation_v4():
                 acc_f, mp_f, mr_f, mf_f, kappa_f = compute_metrics(y_true_all[mask], y_pred_all[mask], labels_front)
                 f2.write(f"[{r['stage']}]\n")
                 f2.write(f"  Acc(front-only)={acc_f:.2f}, MacroP={mp_f:.2f}, MacroR={mr_f:.2f}, MacroF1={mf_f:.2f}, Kappa={kappa_f:.4f}\n\n")
+        # 追記: Presence match（stage4_5）の全体割合
+        if 'presence_total' in locals() and presence_total and presence_total > 0:
+            try:
+                with open(log_path_front, "a", encoding="utf-8") as f3:
+                    f3.write(f"Presence match (stage4_5): {presence_pct:.2f}% ({presence_match}/{presence_total})\n")
+            except Exception:
+                pass
         print(f"[Eval] front-only summary log -> {log_path_front}")
     except Exception as e:
         print(f"[Eval] front-only summary log failed: {e}")

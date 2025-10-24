@@ -873,15 +873,17 @@ def run_visualization_final():
 
         fig = plt.figure(figsize=(16, 12))
         from matplotlib import gridspec
-        gs = gridspec.GridSpec(3, 4, height_ratios=[1, 1, 1], wspace=0.1, hspace=0.15)
+        # 行間(hspace)を拡大、下段2枚の横間(wspace)のみさらに詰める（subgridspecで個別制御）
+        gs = gridspec.GridSpec(3, 4, height_ratios=[1, 1, 1], wspace=0.1, hspace=0.30)
 
         # 上段: 4枚
         axes_top = [plt.subplot(gs[0, i], projection=ccrs.PlateCarree()) for i in range(4)]
         # 中段: 3枚（右端1列は未使用）
         axes_mid = [plt.subplot(gs[1, i], projection=ccrs.PlateCarree()) for i in range(3)]
-        # 下段: 左に Stage4.5（2列幅）、右に GT（2列幅）
-        ax_bottom_left = plt.subplot(gs[2, 0:2], projection=ccrs.PlateCarree())
-        ax_bottom_right = plt.subplot(gs[2, 2:4], projection=ccrs.PlateCarree())
+        # 下段: 左に Stage4.5、右に GT（下段のみ wspace を小さくして“より近づける”）
+        bottom_sub = gs[2, :].subgridspec(1, 2, wspace=0.02)
+        ax_bottom_left = plt.subplot(bottom_sub[0, 0], projection=ccrs.PlateCarree())
+        ax_bottom_right = plt.subplot(bottom_sub[0, 1], projection=ccrs.PlateCarree())
 
         # 描画用 extent
         lat_ref, lon_ref = plat, plon
