@@ -95,21 +95,51 @@ def _open_cached(file_cache: Dict[str, xr.Dataset], path: str, max_size: int) ->
 def _ensure_3times_exist(ds_gsm: xr.Dataset, t_now: np.datetime64) -> Optional[Tuple[np.datetime64, np.datetime64]]:
     """
     関数概要:
-      GSM データセットの時刻軸において、t_now の前後6時間（t-6h, t, t+6h）が全て存在するかをチェックする。
+      t_now の前後6時間（t-6h, t, t+6h）が「月を跨いでも」全て存在するかをチェックする。
+      現在開いている ds_gsm に無い場合は、隣接月ファイル（gsmYYYYMM.nc）を開いて存在確認を行う。
     入力:
-      - ds_gsm (xr.Dataset): GSM の xarray データセット（time, lat, lon, variables）
+      - ds_gsm (xr.Dataset): ある月の GSM データセット
       - t_now (np.datetime64): チェック対象の中心時刻
-    処理:
-      - pandas を用いて t-6h, t+6h を計算し、ds_gsm["time"] に全て含まれるかを検査。
     出力:
       - Optional[Tuple[np.datetime64, np.datetime64]]:
         3時刻が全て存在する場合は (t_prev, t_next) を返す。存在しない場合は None。
     """
-    t_prev = pd.to_datetime(t_now) - pd.Timedelta(hours=6)
-    t_next = pd.to_datetime(t_now) + pd.Timedelta(hours=6)
-    t_prev_np = np.datetime64(t_prev)
-    t_next_np = np.datetime64(t_next)
-    if (t_prev_np in ds_gsm["time"]) and (t_next_np in ds_gsm["time"]) and (t_now in ds_gsm["time"]):
+    t_prev_dt = pd.to_datetime(t_now) - pd.Timedelta(hours=6)
+    t_next_dt = pd.to_datetime(t_now) + pd.Timedelta(hours=6)
+    t_prev_np = np.datetime64(t_prev_dt)
+    t_next_np = np.datetime64(t_next_dt)
+
+    def _in_ds(ds: xr.Dataset, t: np.datetime64) -> bool:
+        try:
+            return bool(t in ds["time"].values)
+        except Exception:
+            return False
+
+    ok_now = _in_ds(ds_gsm, t_now)
+
+    ok_prev = _in_ds(ds_gsm, t_prev_np)
+    if not ok_prev:
+        prev_month = pd.to_datetime(t_prev_np).strftime("%Y%m")
+        prev_path = os.path.join(nc_gsm_dir, f"gsm{prev_month}.nc")
+        if os.path.exists(prev_path):
+            try:
+                with xr.open_dataset(prev_path) as d2:
+                    ok_prev = bool(t_prev_np in d2["time"].values)
+            except Exception:
+                ok_prev = False
+
+    ok_next = _in_ds(ds_gsm, t_next_np)
+    if not ok_next:
+        next_month = pd.to_datetime(t_next_np).strftime("%Y%m")
+        next_path = os.path.join(nc_gsm_dir, f"gsm{next_month}.nc")
+        if os.path.exists(next_path):
+            try:
+                with xr.open_dataset(next_path) as d2:
+                    ok_next = bool(t_next_np in d2["time"].values)
+            except Exception:
+                ok_next = False
+
+    if ok_now and ok_prev and ok_next:
         return t_prev_np, t_next_np
     return None
 
@@ -118,17 +148,39 @@ def _read_gsm_93(ds_gsm: xr.Dataset, t_prev: np.datetime64, t_now: np.datetime64
     """
     関数概要:
       GSM の 31 変数を 3 時刻（t-6h, t, t+6h）で取り出し、チャネル方向に連結して (93,H,W) を作る。
+      各時刻が現在の月ファイルに存在しない場合は、該当時刻の属する月のファイルを開いて読み出す（跨月対応）。
     入力:
-      - ds_gsm (xr.Dataset): GSM データセット
-      - t_prev, t_now, t_next (np.datetime64): 3時刻（_ensure_3times_exist で妥当性確認済み）
-    処理:
-      - sel(time=*) → to_array() → values で (C=31,H,W) を3つ取得し、axis=0 方向に連結して 93 チャネルにする。
+      - ds_gsm (xr.Dataset): 現在の月の GSM データセット
+      - t_prev, t_now, t_next (np.datetime64): 3時刻
     出力:
       - np.ndarray: (93,H,W) の float32 配列（モデル入力用）
     """
-    data_prev = ds_gsm.sel(time=t_prev).to_array().load().values
-    data_now = ds_gsm.sel(time=t_now).to_array().load().values
-    data_next = ds_gsm.sel(time=t_next).to_array().load().values
+    import xarray as xr
+
+    def _read_one(t: np.datetime64) -> np.ndarray:
+        # まず現在の ds_gsm から試みる
+        try:
+            if t in ds_gsm["time"].values:
+                return ds_gsm.sel(time=t).to_array().load().values
+        except Exception:
+            pass
+        # 存在しない場合は該当月ファイルを開く
+        month = pd.to_datetime(t).strftime("%Y%m")
+        path = os.path.join(nc_gsm_dir, f"gsm{month}.nc")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"GSM file not found for time={t}: {path}")
+        ds2 = xr.open_dataset(path)
+        try:
+            if t not in ds2["time"].values:
+                raise KeyError(f"time {t} not found in {path}")
+            return ds2.sel(time=t).to_array().load().values
+        finally:
+            ds2.close()
+
+    data_prev = _read_one(t_prev)
+    data_now = _read_one(t_now)
+    data_next = _read_one(t_next)
+
     gsm = np.concatenate([data_prev, data_now, data_next], axis=0).astype(np.float32)
     return gsm
 
