@@ -1,0 +1,29 @@
+@/src/FrontLine/main_v4.py
+@/src/FrontLine/swin_unet.py
+@/src/FrontLine/main_v4/__init__.py
+@/src/FrontLine/main_v4/main_v4_config.py
+@/src/FrontLine/main_v4/main_v4_datasets.py
+@/src/FrontLine/main_v4/main_v4_evaluation.py
+@/src/FrontLine/main_v4/main_v4_models.py
+@/src/FrontLine/main_v4/main_v4_stage1_5.py
+@/src/FrontLine/main_v4/main_v4_stage1.py
+@/src/FrontLine/main_v4/main_v4_stage2_5.py
+@/src/FrontLine/main_v4/main_v4_stage2.py
+@/src/FrontLine/main_v4/main_v4_stage3_5.py
+@/src/FrontLine/main_v4/main_v4_stage3.py
+@/src/FrontLine/main_v4/main_v4_stage4_5.py
+@/src/FrontLine/main_v4/main_v4_stage4.py
+@/src/FrontLine/main_v4/main_v4_visualize.py
+
+上記プログラムを詳しく確認して内容を完璧に理解してください
+まずは上記のプログラムの目的、処理、アルゴリズム、どんな変数やデータをどう使っているかなどを詳しく把握してください
+上記プログラムの実行において、以下の問題が発生していると専門家から指摘が入っています
+```
+地形系
+    どうしても日本列島をまたぐものや、高い山（台湾・朝鮮半島・沿海州）の近くは苦手
+    なにか対処策はない？
+```
+
+なぜこのような現状が起こるのかを気象学的な観点などいろいろ考察してください
+その上で効果的な改善策も複数提示してください
+日本語で解説
