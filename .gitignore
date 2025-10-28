@@ -1,6 +1,7 @@
 # Result directories
 result_*/
 
+.DS_Store
 # Python
 __pycache__/
 *.py[cod]
