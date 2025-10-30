@@ -141,8 +141,7 @@ CFG = {
             "betas": (0.9, 0.99),
         },
         "model": {
-            **MODEL_BASE,
-            "ape": True,
+            **MODEL_BASE
         },
     },
     # Stage2.5: 「接合と繋がる」温暖・寒冷のみ残す。接合も温暖/寒冷双方に繋がるもののみ残す
@@ -172,8 +171,7 @@ CFG = {
             "betas": (0.9, 0.999),
         },
         "model": {
-            **MODEL_BASE,
-            "ape": True,
+            **MODEL_BASE
         },
     },
     # Stage3.5: 閉塞は温暖/寒冷/接合のいずれかに付着するもののみ残す
@@ -203,8 +201,7 @@ CFG = {
             "betas": (0.9, 0.999),
         },
         "model": {
-            **MODEL_BASE,
-            "ape": True,
+            **MODEL_BASE
         },
     },
     # Stage4.5: 小さい停滞の削除、寒冷に付着した停滞は寒冷へ変更。最終アセンブル
